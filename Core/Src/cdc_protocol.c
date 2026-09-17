@@ -11,6 +11,7 @@
 
 extern volatile uint16_t line_adc_right[8];
 extern volatile uint16_t line_adc_center[8];
+extern volatile uint32_t line_adc_center_last_update_tick;
 extern volatile bool limit_bottom;
 extern volatile bool limit_top;
 extern volatile uint16_t TOF_arm;
@@ -167,6 +168,8 @@ void CDC_Protocol_Process(char *rx)
             line_adc_center[i] = (uint16_t)line_values[i];
         }
 
+        line_adc_center_last_update_tick = HAL_GetTick();
+
         snprintf(
             tx_buf, sizeof(tx_buf),
             "OK LINE %u %u %u %u %u %u %u %u\r\n",
@@ -237,8 +240,8 @@ void CDC_Protocol_Process(char *rx)
         }
 
         /* Limit switches are measured by the dedicated sensor MCU. */
-        limit_bottom = (value1 != 0U);
-        limit_top = (value2 != 0U);
+        limit_top = (value1 != 0U);
+        limit_bottom = (value2 != 0U);
         snprintf(tx_buf, sizeof(tx_buf), "OK LIMIT %u %u\r\n", limit_bottom ? 1U : 0U, limit_top ? 1U : 0U);
         send_text(tx_buf);
     }

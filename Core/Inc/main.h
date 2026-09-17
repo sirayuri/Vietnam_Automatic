@@ -32,6 +32,8 @@ extern "C" {
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#include <stdbool.h>
+
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
@@ -55,6 +57,15 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+
+extern volatile bool point_detected;
+extern volatile bool point_event;
+extern volatile bool point_arrived;
+extern volatile bool auto_control_error;
+extern volatile uint32_t current_point_index;
+void PointDetect_Task(void);
+void PointDetect_Reset(void);
+void AutoControl_Task(void);
 
 /* USER CODE END EFP */
 

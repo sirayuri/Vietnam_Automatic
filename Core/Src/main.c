@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32f4xx_hal_gpio.h"
 #include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -29,6 +30,7 @@
 #include "bno_config.h"
 #include <stdint.h>
 #include <math.h>
+#include <stddef.h>
 
 /* USER CODE END Includes */
 
@@ -44,6 +46,26 @@
 #define MOVE_CONTROL_PERIOD_MS   10U
 #define PID_INTEGRAL_LIMIT        1000.0f
 #define DEG_TO_RAD                0.01745329251994329577f
+
+#define LINE_SENSOR_COUNT         8U
+#define POINT_CONFIRM_MS          200U
+#define FRONT_LINE_CONFIRM_MS     200U
+#define POINT_REARM_CLEAR_MS      120U
+#define LINE_CENTER_STALE_MS      100U
+#define FRONT_LINE_MIN_BLACK      3U
+#define POINT_RIGHT_MIN_BLACK     3U
+#define POINT_SEARCH_POWER        700.0f
+#define POINT_ALIGN_POWER         700.0f
+#define POINT_MIN_START_PWM       650.0f
+#define POINT_SEARCH_TIMEOUT_MS   10000U
+#define POINT_ALIGN_TIMEOUT_MS    3000U
+#define FRONT_LINE_ALIGN_TIMEOUT_MS 3000U
+#define FRONT_LINE_FOUND_STABLE_MS  60U
+#define POINT_ALIGN_STABLE_MS     150U
+#define POINT_ALIGN_ERROR_X       0.30f
+#define POINT_ALIGN_ERROR_Y       0.30f
+#define POINT_LED_ON_LEVEL        GPIO_PIN_SET
+#define POINT_LED_OFF_LEVEL       GPIO_PIN_RESET
 
 /* USER CODE END PD */
 
@@ -84,15 +106,28 @@ static void MX_UART4_Init(void);
 static void MX_ADC2_Init(void);
 /* USER CODE BEGIN PFP */
 
+void move_degree(float body_degree, float vx, float vy, float drive_power);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* The LINE sensor connected to this MCU is the left sensor (8 ADC channels). */
+/* The LINE sensor connected to this MCU is the right sensor (8 ADC channels). */
 volatile uint16_t line_adc_right[8];
-/* LINE values received from the dedicated sensor MCU via Raspberry Pi. */
+/* Front LINE values received from the dedicated sensor MCU via Raspberry Pi. */
 volatile uint16_t line_adc_center[8];
+
+/* Set when a new front-line packet is accepted by CDC_Protocol_Process(). */
+volatile uint32_t line_adc_center_last_update_tick = 0U;
+
+/* Point detection status.  point_event is a one-loop pulse. */
+volatile bool point_detected = false;
+volatile bool point_event = false;
+volatile bool point_arrived = false;
+volatile bool auto_control_error = false;
+volatile uint32_t current_point_index = 0U;
+volatile bool point_detection_enabled = false;
 
 volatile bool limit_bottom = false;
 volatile bool limit_top = false;
@@ -103,12 +138,18 @@ volatile uint16_t TOF_hall = 0;
 float P_gain = 9.0;
 float I_gain = 0.0;
 float D_gain = 0.0;
+float point_align_P_gain_x = 0.35f;
+float point_align_P_gain_y = 0.35f;
+float point_align_I_gain_x = 0.0f;
+float point_align_I_gain_y = 0.0f;
+float point_align_D_gain_x = 0.0f;
+float point_align_D_gain_y = 0.0f;
 float PID_err = 0.0;
 float PID_err_old = 0.0;
 float degree_old = 0.0;
 
 /* Set these values from the automatic-control code.  Zero speed is safe. */
-volatile float target_body_degree = 90.0f;
+volatile float target_body_degree = 0.0f;
 volatile float target_move_degree = 0.0f;
 
 static float normalize_degree(float degree)
@@ -135,6 +176,321 @@ static float limit_float(float value, float minimum, float maximum)
     return maximum;
   }
   return value;
+}
+
+typedef struct
+{
+  uint8_t mask;
+  uint8_t black_count;
+  uint8_t longest_run;
+  float score;
+} line_sensor_features_t;
+
+typedef struct
+{
+  float position;
+  float confidence;
+  uint8_t black_count;
+  bool valid;
+} line_sensor_position_t;
+
+/*
+ * These values are initial background models obtained from the supplied
+ * white/green floor logs.  The threshold is the larger of the white and
+ * green background limits, plus a margin.  Black is expected to produce a
+ * larger ADC value.
+ */
+static const float line_right_white_mean[LINE_SENSOR_COUNT] =
+  {3025.0f, 3232.0f, 2745.0f, 2715.0f, 2860.0f, 3133.0f, 2900.0f, 3098.0f};
+static const float line_right_white_sigma[LINE_SENSOR_COUNT] =
+  {  20.0f,   12.0f,   30.0f,   30.0f,   30.0f,   12.0f,   18.0f,   20.0f};
+static const float line_right_green_mean[LINE_SENSOR_COUNT] =
+  {3248.0f, 3177.0f, 2561.0f, 2483.0f, 2776.0f, 3063.0f, 2843.0f, 3071.0f};
+static const float line_right_green_sigma[LINE_SENSOR_COUNT] =
+  {   5.0f,    6.0f,    6.0f,    6.0f,    6.0f,    5.0f,    6.0f,    8.0f};
+
+static const float line_front_white_mean[LINE_SENSOR_COUNT] =
+  {1910.0f, 1540.0f, 1835.0f, 1055.0f, 1410.0f, 1320.0f, 740.0f, 970.0f};
+static const float line_front_white_sigma[LINE_SENSOR_COUNT] =
+  {  12.0f,   12.0f,   10.0f,    8.0f,   10.0f,   10.0f,  12.0f,  10.0f};
+static const float line_front_green_mean[LINE_SENSOR_COUNT] =
+  {1787.0f, 1628.0f, 1868.0f,  645.0f,  731.0f, 1215.0f, 387.0f, 610.0f};
+static const float line_front_green_sigma[LINE_SENSOR_COUNT] =
+  {   8.0f,    7.0f,    7.0f,    7.0f,    7.0f,    7.0f,   7.0f,   8.0f};
+/* Red-floor background measured from the latest front-sensor logs. */
+static const float line_front_red_mean[LINE_SENSOR_COUNT] =
+  {2021.0f, 2154.0f, 1895.0f, 970.0f, 1225.0f, 1314.0f, 351.0f, 669.0f};
+static const float line_front_red_sigma[LINE_SENSOR_COUNT] =
+  {  10.0f,   10.0f,   10.0f,  10.0f,   10.0f,   10.0f,  10.0f,  10.0f};
+
+typedef enum
+{
+  POINT_STATE_ARMED = 0,
+  POINT_STATE_CANDIDATE,
+  POINT_STATE_LATCHED,
+  POINT_STATE_WAIT_REARM
+} point_state_t;
+
+static point_state_t point_state = POINT_STATE_ARMED;
+static uint32_t point_candidate_tick = 0U;
+static uint32_t point_clear_tick = 0U;
+
+static float background_limit(float mean, float sigma)
+{
+  /* Four sigma rejects the measured floor noise; the margin covers drift. */
+  return mean + (4.0f * sigma) + 80.0f;
+}
+
+static void get_line_sensor_features(
+    const volatile uint16_t *raw,
+    const float *white_mean,
+    const float *white_sigma,
+    const float *green_mean,
+    const float *green_sigma,
+    const float *red_mean,
+    const float *red_sigma,
+    line_sensor_features_t *features)
+{
+  features->mask = 0U;
+  features->black_count = 0U;
+  features->longest_run = 0U;
+  features->score = 0.0f;
+
+  uint8_t current_run = 0U;
+
+  for (uint32_t i = 0U; i < LINE_SENSOR_COUNT; i++)
+  {
+    float white_limit = background_limit(white_mean[i], white_sigma[i]);
+    float green_limit = background_limit(green_mean[i], green_sigma[i]);
+    float threshold = (white_limit > green_limit) ? white_limit : green_limit;
+
+    float white_z = ((float)raw[i] - white_mean[i]) /
+                    ((white_sigma[i] > 1.0f) ? white_sigma[i] : 1.0f);
+    float green_z = ((float)raw[i] - green_mean[i]) /
+                    ((green_sigma[i] > 1.0f) ? green_sigma[i] : 1.0f);
+    float z = (white_z > green_z) ? white_z : green_z;
+
+    if ((red_mean != NULL) && (red_sigma != NULL))
+    {
+      float red_limit = background_limit(red_mean[i], red_sigma[i]);
+      if (red_limit > threshold)
+      {
+        threshold = red_limit;
+      }
+
+      float red_z = ((float)raw[i] - red_mean[i]) /
+                    ((red_sigma[i] > 1.0f) ? red_sigma[i] : 1.0f);
+      if (red_z > z)
+      {
+        z = red_z;
+      }
+    }
+
+    if ((float)raw[i] > threshold)
+    {
+      features->mask |= (uint8_t)(1U << i);
+      features->black_count++;
+      current_run++;
+      if (current_run > features->longest_run)
+      {
+        features->longest_run = current_run;
+      }
+      features->score += z;
+    }
+    else
+    {
+      current_run = 0U;
+    }
+  }
+}
+
+/*
+ * A red starting-floor patch can make only front S1 look black.  Do not use
+ * line position alone for the initial front-line detection: require a
+ * continuous group of at least FRONT_LINE_MIN_BLACK sensors.  The measured
+ * vertical guide line can activate all eight sensors, so the active-sensor
+ * count must not be used as an upper-limit direction classifier here.
+ */
+static bool front_line_features_is_present(const line_sensor_features_t *front)
+{
+  return (front->black_count >= FRONT_LINE_MIN_BLACK) &&
+         (front->longest_run >= FRONT_LINE_MIN_BLACK);
+}
+
+static bool right_line_features_is_present(const line_sensor_features_t *right)
+{
+  return (right->black_count >= POINT_RIGHT_MIN_BLACK) &&
+         (right->longest_run >= POINT_RIGHT_MIN_BLACK);
+}
+
+static void get_line_sensor_position(
+    const volatile uint16_t *raw,
+    const float *white_mean,
+    const float *white_sigma,
+    const float *green_mean,
+    const float *green_sigma,
+    const float *red_mean,
+    const float *red_sigma,
+    line_sensor_position_t *result)
+{
+  float weighted_sum = 0.0f;
+  float signal_sum = 0.0f;
+  uint8_t black_count = 0U;
+
+  for (uint32_t i = 0U; i < LINE_SENSOR_COUNT; i++)
+  {
+    float floor_reference =
+        (white_mean[i] > green_mean[i]) ? white_mean[i] : green_mean[i];
+    float sigma =
+        (white_sigma[i] > green_sigma[i]) ? white_sigma[i] : green_sigma[i];
+
+    if ((red_mean != NULL) && (red_mean[i] > floor_reference))
+    {
+      floor_reference = red_mean[i];
+    }
+    if ((red_sigma != NULL) && (red_sigma[i] > sigma))
+    {
+      sigma = red_sigma[i];
+    }
+    float noise_gate = (3.0f * sigma) + 40.0f;
+    float signal = (float)raw[i] - floor_reference - noise_gate;
+
+    if (signal > 0.0f)
+    {
+      weighted_sum += signal * (float)i;
+      signal_sum += signal;
+      black_count++;
+    }
+  }
+
+  result->position = 3.5f;
+  result->confidence = signal_sum;
+  result->black_count = black_count;
+  result->valid = (signal_sum >= 100.0f);
+
+  if (signal_sum > 0.0f)
+  {
+    result->position = weighted_sum / signal_sum;
+  }
+}
+
+static bool point_candidate_is_present(void)
+{
+  line_sensor_features_t front;
+  line_sensor_features_t right;
+
+  uint32_t now = HAL_GetTick();
+
+  if ((line_adc_center_last_update_tick == 0U) ||
+      ((now - line_adc_center_last_update_tick) > LINE_CENTER_STALE_MS))
+  {
+    return false;
+  }
+
+  get_line_sensor_features(
+      line_adc_center,
+      line_front_white_mean,
+      line_front_white_sigma,
+      line_front_green_mean,
+      line_front_green_sigma,
+      line_front_red_mean,
+      line_front_red_sigma,
+      &front);
+
+  get_line_sensor_features(
+      line_adc_right,
+      line_right_white_mean,
+      line_right_white_sigma,
+      line_right_green_mean,
+      line_right_green_sigma,
+      NULL,
+      NULL,
+      &right);
+
+  /*
+   * The front sensor must see the normal guide line.  The right sensor must
+   * see a second, continuous black region.  With the current mounting this
+   * is the first-pass signature of a transverse line/intersection.
+   */
+  bool front_line = front_line_features_is_present(&front);
+  bool right_cross_line = right_line_features_is_present(&right);
+
+  return front_line && right_cross_line;
+}
+
+void PointDetect_Reset(void)
+{
+  point_state = POINT_STATE_ARMED;
+  point_candidate_tick = 0U;
+  point_clear_tick = 0U;
+  point_detected = false;
+  point_event = false;
+}
+
+void PointDetect_Task(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  if (!point_detection_enabled)
+  {
+    PointDetect_Reset();
+    return;
+  }
+
+  bool candidate = point_candidate_is_present();
+
+  /* A pulse lets the route controller advance exactly once per point. */
+  point_event = false;
+
+  switch (point_state)
+  {
+    case POINT_STATE_ARMED:
+      if (candidate)
+      {
+        point_candidate_tick = now;
+        point_state = POINT_STATE_CANDIDATE;
+      }
+      break;
+
+    case POINT_STATE_CANDIDATE:
+      if (!candidate)
+      {
+        point_state = POINT_STATE_ARMED;
+      }
+      else if ((now - point_candidate_tick) >= POINT_CONFIRM_MS)
+      {
+        point_detected = true;
+        point_event = true;
+        point_clear_tick = now;
+        point_state = POINT_STATE_LATCHED;
+      }
+      break;
+
+    case POINT_STATE_LATCHED:
+      /* Keep the event latched while the robot changes to its point flow. */
+      if (!candidate)
+      {
+        point_clear_tick = now;
+        point_state = POINT_STATE_WAIT_REARM;
+      }
+      break;
+
+    case POINT_STATE_WAIT_REARM:
+      if (candidate)
+      {
+        point_state = POINT_STATE_LATCHED;
+      }
+      else if ((now - point_clear_tick) >= POINT_REARM_CLEAR_MS)
+      {
+        point_detected = false;
+        point_state = POINT_STATE_ARMED;
+      }
+      break;
+
+    default:
+      PointDetect_Reset();
+      break;
+  }
 }
 
 static void set_motor_pwm(TIM_HandleTypeDef *timer,
@@ -198,6 +554,452 @@ static void start_motor_pwm(void)
  *   M1 RR = y + x - rot       M2 RL = y - x + rot
  *   M3 FL = y + x + rot       M4 FR = y - x - rot
  */
+typedef enum
+{
+  AUTO_STATE_MOVE_RIGHT_TO_LINE = 0,
+  AUTO_STATE_ALIGN_FRONT_LINE,
+  AUTO_STATE_MOVE_FORWARD_TO_POINT,
+  AUTO_STATE_ALIGN_POINT,
+  AUTO_STATE_POINT_REACHED,
+  AUTO_STATE_ERROR
+} auto_state_t;
+
+static auto_state_t auto_state = AUTO_STATE_MOVE_RIGHT_TO_LINE;
+static uint32_t auto_state_tick = 0U;
+static uint32_t front_line_stable_tick = 0U;
+static uint32_t front_line_detect_candidate_tick = 0U;
+static uint32_t point_align_stable_tick = 0U;
+static float point_align_integral_x = 0.0f;
+static float point_align_integral_y = 0.0f;
+static float point_align_previous_x = 0.0f;
+static float point_align_previous_y = 0.0f;
+static uint32_t point_align_last_tick = 0U;
+
+static void apply_minimum_motion_vector(float *vx, float *vy)
+{
+  float vector_size = sqrtf((*vx * *vx) + (*vy * *vy));
+  float minimum_vector = POINT_MIN_START_PWM / POINT_ALIGN_POWER;
+
+  if (vector_size <= 0.001f)
+  {
+    *vx = 0.0f;
+    *vy = 0.0f;
+    return;
+  }
+
+  if (vector_size > 1.0f)
+  {
+    *vx /= vector_size;
+    *vy /= vector_size;
+    vector_size = 1.0f;
+  }
+
+  if (vector_size < minimum_vector)
+  {
+    float scale = minimum_vector / vector_size;
+    *vx *= scale;
+    *vy *= scale;
+  }
+}
+
+static void point_align_reset(void)
+{
+  point_align_stable_tick = 0U;
+  point_align_integral_x = 0.0f;
+  point_align_integral_y = 0.0f;
+  point_align_previous_x = 0.0f;
+  point_align_previous_y = 0.0f;
+  point_align_last_tick = 0U;
+}
+
+/* Instantaneous front-line result used while already in the alignment state. */
+static bool front_line_raw_is_present(void)
+{
+  line_sensor_features_t front_features;
+  line_sensor_position_t front;
+
+  if ((line_adc_center_last_update_tick == 0U) ||
+      ((HAL_GetTick() - line_adc_center_last_update_tick) > LINE_CENTER_STALE_MS))
+  {
+    return false;
+  }
+
+  get_line_sensor_position(
+      line_adc_center,
+      line_front_white_mean,
+      line_front_white_sigma,
+      line_front_green_mean,
+      line_front_green_sigma,
+      line_front_red_mean,
+      line_front_red_sigma,
+      &front);
+
+  get_line_sensor_features(
+      line_adc_center,
+      line_front_white_mean,
+      line_front_white_sigma,
+      line_front_green_mean,
+      line_front_green_sigma,
+      line_front_red_mean,
+      line_front_red_sigma,
+      &front_features);
+
+  return front_line_features_is_present(&front_features);
+}
+
+/*
+ * Confirm the front line over time before allowing the automatic flow to
+ * change state.  This prevents a single noisy CDC packet from immediately
+ * entering AUTO_STATE_ALIGN_FRONT_LINE.
+ */
+static bool front_line_is_present(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  if (!front_line_raw_is_present())
+  {
+    front_line_detect_candidate_tick = 0U;
+    return false;
+  }
+
+  if (front_line_detect_candidate_tick == 0U)
+  {
+    front_line_detect_candidate_tick = now;
+  }
+
+  return (now - front_line_detect_candidate_tick) >= FRONT_LINE_CONFIRM_MS;
+}
+
+/*
+ * Debug indication for line geometry:
+ *   green = front/vertical line only
+ *   blue  = right/horizontal line only
+ *   red   = both sensors, i.e. intersection
+ *   off   = no detected line
+ *
+ * This deliberately uses the same configured consecutive-sensor rule as the
+ * motion flow, so the LED state shows the condition that can actually trigger
+ * a state transition.
+ */
+static void LineDebugLED_Task(void)
+{
+  line_sensor_features_t front;
+  line_sensor_features_t right;
+  bool front_line = false;
+  bool right_line = false;
+  uint32_t now = HAL_GetTick();
+
+  if ((line_adc_center_last_update_tick != 0U) &&
+      ((now - line_adc_center_last_update_tick) <= LINE_CENTER_STALE_MS))
+  {
+    get_line_sensor_features(
+        line_adc_center,
+        line_front_white_mean,
+        line_front_white_sigma,
+        line_front_green_mean,
+        line_front_green_sigma,
+        line_front_red_mean,
+        line_front_red_sigma,
+        &front);
+    front_line = front_line_features_is_present(&front);
+  }
+
+  get_line_sensor_features(
+      line_adc_right,
+      line_right_white_mean,
+      line_right_white_sigma,
+      line_right_green_mean,
+      line_right_green_sigma,
+      NULL,
+      NULL,
+      &right);
+  right_line = right_line_features_is_present(&right);
+
+  HAL_GPIO_WritePin(
+      LED_G_GPIO_Port,
+      LED_G_Pin,
+      (front_line && !right_line) ? POINT_LED_ON_LEVEL : POINT_LED_OFF_LEVEL);
+  HAL_GPIO_WritePin(
+      LED_B_GPIO_Port,
+      LED_B_Pin,
+      (right_line && !front_line) ? POINT_LED_ON_LEVEL : POINT_LED_OFF_LEVEL);
+  HAL_GPIO_WritePin(
+      LED_R_GPIO_Port,
+      LED_R_Pin,
+      (front_line && right_line) ? POINT_LED_ON_LEVEL : POINT_LED_OFF_LEVEL);
+}
+
+static bool front_line_align_update(uint32_t now)
+{
+  line_sensor_position_t front;
+
+  if (!front_line_raw_is_present())
+  {
+    front_line_stable_tick = 0U;
+    move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+    return false;
+  }
+
+  get_line_sensor_position(
+      line_adc_center,
+      line_front_white_mean,
+      line_front_white_sigma,
+      line_front_green_mean,
+      line_front_green_sigma,
+      line_front_red_mean,
+      line_front_red_sigma,
+      &front);
+
+  /* Front S0 is right and S7 is left: positive error means move right. */
+  float error_x = 3.5f - front.position;
+
+  if (fabsf(error_x) <= POINT_ALIGN_ERROR_X)
+  {
+    move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+
+    if (front_line_stable_tick == 0U)
+    {
+      front_line_stable_tick = now;
+    }
+
+    return (now - front_line_stable_tick) >= FRONT_LINE_FOUND_STABLE_MS;
+  }
+
+  front_line_stable_tick = 0U;
+
+  float vx = point_align_P_gain_x * error_x;
+  float vector_size = fabsf(vx);
+  if (vector_size > 1.0f)
+  {
+    vx = (vx > 0.0f) ? 1.0f : -1.0f;
+  }
+  else if (vector_size > 0.001f)
+  {
+    float minimum_vector = POINT_MIN_START_PWM / POINT_ALIGN_POWER;
+    if (vector_size < minimum_vector)
+    {
+      vx = (vx > 0.0f) ? minimum_vector : -minimum_vector;
+    }
+  }
+
+  move_degree(0.0f, vx, 0.0f, POINT_ALIGN_POWER);
+  return false;
+}
+
+static bool point_align_update(uint32_t now)
+{
+  line_sensor_position_t front;
+  line_sensor_position_t right;
+
+  if ((line_adc_center_last_update_tick == 0U) ||
+      ((now - line_adc_center_last_update_tick) > LINE_CENTER_STALE_MS))
+  {
+    point_align_stable_tick = 0U;
+    move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+    return false;
+  }
+
+  get_line_sensor_position(
+      line_adc_center,
+      line_front_white_mean,
+      line_front_white_sigma,
+      line_front_green_mean,
+      line_front_green_sigma,
+      line_front_red_mean,
+      line_front_red_sigma,
+      &front);
+
+  get_line_sensor_position(
+      line_adc_right,
+      line_right_white_mean,
+      line_right_white_sigma,
+      line_right_green_mean,
+      line_right_green_sigma,
+      NULL,
+      NULL,
+      &right);
+
+  if (!front.valid || !right.valid)
+  {
+    point_align_stable_tick = 0U;
+    move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+    return false;
+  }
+
+  /* Front S0 is right and S7 is left: positive error means move right. */
+  float error_x = 3.5f - front.position;
+
+  /* Right S0 is rear/lower and S7 is front/upper: positive means move forward. */
+  float error_y = right.position - 3.5f;
+
+  float dt = (point_align_last_tick == 0U) ?
+             0.01f : ((float)(now - point_align_last_tick) / 1000.0f);
+  if (dt < 0.001f)
+  {
+    dt = 0.001f;
+  }
+  point_align_last_tick = now;
+
+  point_align_integral_x += error_x * dt;
+  point_align_integral_y += error_y * dt;
+  point_align_integral_x = limit_float(point_align_integral_x, -3.0f, 3.0f);
+  point_align_integral_y = limit_float(point_align_integral_y, -3.0f, 3.0f);
+
+  float derivative_x = (error_x - point_align_previous_x) / dt;
+  float derivative_y = (error_y - point_align_previous_y) / dt;
+  point_align_previous_x = error_x;
+  point_align_previous_y = error_y;
+
+  float vx = (point_align_P_gain_x * error_x) +
+             (point_align_I_gain_x * point_align_integral_x) +
+             (point_align_D_gain_x * derivative_x);
+  float vy = (point_align_P_gain_y * error_y) +
+             (point_align_I_gain_y * point_align_integral_y) +
+             (point_align_D_gain_y * derivative_y);
+
+  if ((fabsf(error_x) <= POINT_ALIGN_ERROR_X) &&
+      (fabsf(error_y) <= POINT_ALIGN_ERROR_Y))
+  {
+    move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+
+    if (point_align_stable_tick == 0U)
+    {
+      point_align_stable_tick = now;
+    }
+
+    return (now - point_align_stable_tick) >= POINT_ALIGN_STABLE_MS;
+  }
+
+  point_align_stable_tick = 0U;
+  apply_minimum_motion_vector(&vx, &vy);
+  move_degree(target_body_degree, vx, vy, POINT_ALIGN_POWER);
+  return false;
+}
+
+void AutoControl_Task(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  switch (auto_state)
+  {
+    case AUTO_STATE_MOVE_RIGHT_TO_LINE:
+      point_arrived = false;
+      point_detection_enabled = false;
+
+      if ((line_adc_center_last_update_tick == 0U) ||
+          ((now - line_adc_center_last_update_tick) > LINE_CENTER_STALE_MS))
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        auto_state_tick = 0U;
+        break;
+      }
+
+      if (auto_state_tick == 0U)
+      {
+        auto_state_tick = now;
+      }
+
+      if ((now - auto_state_tick) > POINT_SEARCH_TIMEOUT_MS)
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      /* First move right while holding body angle 0 degrees. */
+      move_degree(0.0f, 1.0f, 0.0f, POINT_SEARCH_POWER);
+
+      if (front_line_is_present())
+      {
+        front_line_stable_tick = now;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ALIGN_FRONT_LINE;
+      }
+      break;
+
+    case AUTO_STATE_ALIGN_FRONT_LINE:
+      point_detection_enabled = false;
+
+      if ((now - auto_state_tick) > FRONT_LINE_ALIGN_TIMEOUT_MS)
+      {
+        move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      if (front_line_align_update(now))
+      {
+        move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+        point_align_reset();
+        PointDetect_Reset();
+        point_detection_enabled = true;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_MOVE_FORWARD_TO_POINT;
+      }
+      break;
+
+    case AUTO_STATE_MOVE_FORWARD_TO_POINT:
+      point_detection_enabled = true;
+
+      if ((now - auto_state_tick) > POINT_SEARCH_TIMEOUT_MS)
+      {
+        move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      /* The front line is centered; now approach the intersection forward. */
+      move_degree(0.0f, 0.0f, 1.0f, POINT_SEARCH_POWER);
+
+      if (point_event)
+      {
+        move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+        point_align_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ALIGN_POINT;
+      }
+      break;
+
+    case AUTO_STATE_ALIGN_POINT:
+      point_detection_enabled = true;
+
+      if ((now - auto_state_tick) > POINT_ALIGN_TIMEOUT_MS)
+      {
+        move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      if (point_align_update(now))
+      {
+        point_arrived = true;
+        current_point_index++;
+        move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+        auto_state = AUTO_STATE_POINT_REACHED;
+      }
+      break;
+
+    case AUTO_STATE_POINT_REACHED:
+      /* Hold here until the next point-specific action is implemented. */
+      move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+      break;
+
+    case AUTO_STATE_ERROR:
+      move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+      break;
+
+    default:
+      move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+      auto_control_error = true;
+      auto_state = AUTO_STATE_ERROR;
+      break;
+  }
+}
+
 void move_degree(float body_degree, float vx, float vy, float drive_power)
 {
   static uint32_t last_tick = 0U;
@@ -362,7 +1164,11 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     CDC_Protocol_Task();
-    // move_degree(target_body_degree, 1, 0,600);
+    PointDetect_Task();
+    AutoControl_Task();
+
+    /* RGB LED is reserved for line geometry debugging. */
+    LineDebugLED_Task();
     // CDC_Debug_Task();
 
 
