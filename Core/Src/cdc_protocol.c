@@ -222,8 +222,8 @@ void CDC_Protocol_Process(char *rx)
             return;
         }
 
-        TOF_arm = (uint16_t)value1;
-        TOF_hall = (uint16_t)value2;
+        TOF_arm = (uint16_t)value2;
+        TOF_hall = (uint16_t)value1;
         tof_last_update_tick = HAL_GetTick();
         snprintf(tx_buf, sizeof(tx_buf), "OK TOF %u %u\r\n", (unsigned int)TOF_arm, (unsigned int)TOF_hall);
         send_text(tx_buf);

@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32f4xx.h"
 #include "stm32f4xx_hal_gpio.h"
 #include "usb_device.h"
 
@@ -43,13 +44,14 @@
 /* USER CODE BEGIN PD */
 
 #define MOTOR_PWM_LIMIT          800.0f
+#define ARM_VERTICAL_PWM_LIMIT   900.0f
 #define MOVE_CONTROL_PERIOD_MS   10U
 #define PID_INTEGRAL_LIMIT        1000.0f
 #define DEG_TO_RAD                0.01745329251994329577f
 
 #define LINE_SENSOR_COUNT         8U
-#define POINT_CONFIRM_MS          200U
-#define FRONT_LINE_CONFIRM_MS     200U
+#define POINT_CONFIRM_MS          300U
+#define FRONT_LINE_CONFIRM_MS     300U
 #define POINT_REARM_CLEAR_MS      120U
 #define LINE_CENTER_STALE_MS      200U
 #define FRONT_LINE_MIN_BLACK      3U
@@ -58,25 +60,30 @@
 #define POINT_ALIGN_POWER         700.0f
 #define POINT_MIN_START_PWM       650.0f
 #define DONUT_MOVE_POWER          700.0f
-#define DONUT_TOF_STALE_MS        300U
+#define DONUT_TOF_STALE_MS        600U
 #define DONUT_TOF_CONFIRM_MS      150U
 #define DONUT_TOF_TOLERANCE_MM    15U
 #define DONUT_MIN_DISTANCE_DROP_MM 30U
 #define DONUT_MOVE_TIMEOUT_MS     10000U
 #define DONUT_GUIDE_APPROACH_POWER 650.0f
-#define DONUT_GUIDE_APPROACH_MS    500U
-#define ARM_LOWER_POWER            700.0f
-#define ARM_LOWER_TIMEOUT_MS       5000U
+#define DONUT_GUIDE_APPROACH_MS    700U
+#define ARM_LOWER_POWER            900.0f
+#define ARM_STARTUP_HOME_POWER     850.0f
+#define ARM_GRIPPER_CLOSE_POWER    600.0f
+#define ARM_GRIPPER_HOLD_TOF_MM     87U
+#define ARM_GRIPPER_CONFIRM_MS      100U
+#define ARM_HALF_RAISE_MS          1200U
+#define ROUTE_FINAL_FORWARD_POINTS    3U
 #define LINE_RED_SIGMA_FLOOR       20.0f
 #define ENABLE_ARM_VERTICAL       1U
-#define ARM_LIMIT_STALE_MS        300U
 #define POINT_SEARCH_TIMEOUT_MS   10000U
 #define POINT_ALIGN_TIMEOUT_MS    3000U
+#define ROUTE_ALIGN_TIMEOUT_MS    1000U
 #define FRONT_LINE_ALIGN_TIMEOUT_MS 3000U
 #define FRONT_LINE_FOUND_STABLE_MS  60U
-#define POINT_ALIGN_STABLE_MS     150U
-#define POINT_ALIGN_ERROR_X       0.30f
-#define POINT_ALIGN_ERROR_Y       0.30f
+#define POINT_ALIGN_STABLE_MS     100U
+#define POINT_ALIGN_ERROR_X       0.50f
+#define POINT_ALIGN_ERROR_Y       0.50f
 #define POINT_LED_ON_LEVEL        GPIO_PIN_SET
 #define POINT_LED_OFF_LEVEL       GPIO_PIN_RESET
 
@@ -163,6 +170,8 @@ volatile uint32_t donut_guide_approach_time_ms = DONUT_GUIDE_APPROACH_MS;
 
 /* +PWM = arm down, -PWM = arm up.  Kept at zero until the arm is tested. */
 volatile float arm_vertical_command = 0.0f;
+/* Motor 5: +PWM opens the gripper, -PWM closes it. */
+volatile float arm_gripper_command = 0.0f;
 
 float P_gain = 9.0;
 float I_gain = 0.0;
@@ -238,6 +247,11 @@ static const float line_right_green_mean[LINE_SENSOR_COUNT] =
   {3248.0f, 3177.0f, 2561.0f, 2483.0f, 2776.0f, 3063.0f, 2843.0f, 3071.0f};
 static const float line_right_green_sigma[LINE_SENSOR_COUNT] =
   {   5.0f,    6.0f,    6.0f,    6.0f,    6.0f,    5.0f,    6.0f,    8.0f};
+/* Red-floor model is used for right-sensor position calculation only. */
+static const float line_right_red_mean[LINE_SENSOR_COUNT] =
+  {3247.46f, 3196.08f, 2615.85f, 2514.88f, 2793.15f, 3094.15f, 2889.23f, 3108.58f};
+static const float line_right_red_sigma[LINE_SENSOR_COUNT] =
+  {  27.41f,   10.12f,   21.18f,    7.86f,    8.73f,   21.19f,   20.96f,    9.94f};
 static const float line_front_white_mean[LINE_SENSOR_COUNT] =
   {1910.0f, 1540.0f, 1835.0f, 1055.0f, 1410.0f, 1320.0f, 740.0f, 970.0f};
 static const float line_front_white_sigma[LINE_SENSOR_COUNT] =
@@ -267,7 +281,7 @@ static uint32_t point_clear_tick = 0U;
 static float background_limit(float mean, float sigma)
 {
   /* Four sigma rejects the measured floor noise; the margin covers drift. */
-  return mean + (4.0f * sigma) + 80.0f;
+  return mean + (4.0f * sigma) + 120.0f;
 }
 
 static float red_background_limit(float mean, float sigma)
@@ -538,12 +552,27 @@ void PointDetect_Task(void)
   }
 }
 
-static void set_motor_pwm(TIM_HandleTypeDef *timer,
-                          uint32_t forward_channel,
-                          uint32_t reverse_channel,
-                          float command)
+/* Stop as soon as an intersection candidate appears.  Confirmation then
+ * happens while stationary, preventing the 300 ms confirmation interval from
+ * carrying the chassis past the center of the intersection. */
+static void point_search_move(float body_degree, float vx, float vy)
 {
-  command = limit_float(command, -MOTOR_PWM_LIMIT, MOTOR_PWM_LIMIT);
+  if (point_state == POINT_STATE_CANDIDATE)
+  {
+    move_degree(body_degree, 0.0f, 0.0f, 0.0f);
+    return;
+  }
+
+  move_degree(body_degree, vx, vy, POINT_SEARCH_POWER);
+}
+
+static void set_motor_pwm_with_limit(TIM_HandleTypeDef *timer,
+                                     uint32_t forward_channel,
+                                     uint32_t reverse_channel,
+                                     float command,
+                                     float pwm_limit)
+{
+  command = limit_float(command, -pwm_limit, pwm_limit);
 
   if (command >= 0.0f)
   {
@@ -557,23 +586,39 @@ static void set_motor_pwm(TIM_HandleTypeDef *timer,
   }
 }
 
+static void set_motor_pwm(TIM_HandleTypeDef *timer,
+                          uint32_t forward_channel,
+                          uint32_t reverse_channel,
+                          float command)
+{
+  set_motor_pwm_with_limit(
+      timer,
+      forward_channel,
+      reverse_channel,
+      command,
+      MOTOR_PWM_LIMIT);
+}
+
 /*
  * Motor 6 vertical arm control.
  *   command > 0 : down  (TIM4 CH1)
  *   command < 0 : up    (TIM4 CH2)
  *
  * limit_top and limit_bottom are the active-state booleans received from the
- * dedicated sensor MCU via CDC.  A stale limit packet also stops the motor.
+ * dedicated sensor MCU via CDC.  The first LIMIT packet must arrive before
+ * the motor is allowed to move; after that, the latest received state is used.
  */
 static void ArmVertical_Move(float command)
 {
 #if ENABLE_ARM_VERTICAL
-  uint32_t now = HAL_GetTick();
-
-  if ((limit_last_update_tick == 0U) ||
-      ((now - limit_last_update_tick) > ARM_LIMIT_STALE_MS))
+  if (limit_last_update_tick == 0U)
   {
-    set_motor_pwm(&htim4, TIM_CHANNEL_1, TIM_CHANNEL_2, 0.0f);
+    set_motor_pwm_with_limit(
+        &htim4,
+        TIM_CHANNEL_1,
+        TIM_CHANNEL_2,
+        0.0f,
+        ARM_VERTICAL_PWM_LIMIT);
     return;
   }
 
@@ -589,12 +634,68 @@ static void ArmVertical_Move(float command)
     command = 0.0f;
   }
 
-  set_motor_pwm(&htim4, TIM_CHANNEL_1, TIM_CHANNEL_2, command);
+  set_motor_pwm_with_limit(
+      &htim4,
+      TIM_CHANNEL_1,
+      TIM_CHANNEL_2,
+      command,
+      ARM_VERTICAL_PWM_LIMIT);
 #else
   /* Keep motor 6 stopped while arm control is disabled for testing. */
   (void)command;
-  set_motor_pwm(&htim4, TIM_CHANNEL_1, TIM_CHANNEL_2, 0.0f);
+  set_motor_pwm_with_limit(
+      &htim4,
+      TIM_CHANNEL_1,
+      TIM_CHANNEL_2,
+      0.0f,
+      ARM_VERTICAL_PWM_LIMIT);
 #endif
+}
+
+/* Motor 5 gripper control.
+ *   command > 0 : open  (TIM2 CH1)
+ *   command < 0 : close (TIM2 CH2)
+ */
+static void ArmGripper_Move(float command)
+{
+  set_motor_pwm(&htim2, TIM_CHANNEL_1, TIM_CHANNEL_2, command);
+}
+
+/* Startup homing state for motor 6.  The robot must not start its drive flow
+ * until the arm has reached the top limit once after power-up. */
+static bool arm_startup_home_done = false;
+
+static bool ArmStartupHome_Task(void)
+{
+  /* Keep the base stopped while the arm is homing. */
+  move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+  point_detection_enabled = false;
+
+  if (arm_startup_home_done)
+  {
+    arm_vertical_command = 0.0f;
+    return arm_startup_home_done;
+  }
+
+  /* Wait indefinitely for the Raspberry Pi/sensor MCU to start sending
+   * LIMIT packets.  Do not start the arm before the first packet arrives. */
+  if (limit_last_update_tick == 0U)
+  {
+    arm_vertical_command = 0.0f;
+    return false;
+  }
+
+  /* Already at the top: homing is complete without moving the arm. */
+  if (limit_top)
+  {
+    arm_vertical_command = 0.0f;
+    arm_startup_home_done = true;
+    return true;
+  }
+
+  /* Motor 6: negative command is up. */
+  arm_vertical_command = -ARM_STARTUP_HOME_POWER;
+  return false;
 }
 
 static void stop_drive_motors(void)
@@ -649,7 +750,17 @@ typedef enum
   AUTO_STATE_MOVE_TO_DONUT,
   AUTO_STATE_DONUT_GUIDE_APPROACH,
   AUTO_STATE_LOWER_ARM,
+  AUTO_STATE_CLOSE_ARM,
   AUTO_STATE_DONUT_REACHED,
+  AUTO_STATE_RAISE_ARM_HALF,
+  AUTO_STATE_ROUTE_LEAVE_DONUT_POINT,
+  AUTO_STATE_ROUTE_FORWARD_TO_POINT,
+  AUTO_STATE_ROUTE_ALIGN_FORWARD_POINT,
+  AUTO_STATE_ROUTE_LEFT_TO_POINT,
+  AUTO_STATE_ROUTE_ALIGN_LEFT_POINT,
+  AUTO_STATE_ROUTE_FORWARD_COUNT_POINTS,
+  AUTO_STATE_ROUTE_ALIGN_FINAL_POINT,
+  AUTO_STATE_ROUTE_COMPLETE,
   AUTO_STATE_ERROR
 } auto_state_t;
 
@@ -664,6 +775,9 @@ static float point_align_previous_x = 0.0f;
 static float point_align_previous_y = 0.0f;
 static uint32_t point_align_last_tick = 0U;
 static uint32_t donut_surface_candidate_tick = 0U;
+static uint32_t gripper_hold_candidate_tick = 0U;
+static uint32_t route_depart_clear_tick = 0U;
+static uint8_t route_final_forward_point_count = 0U;
 
 static void apply_minimum_motion_vector(float *vx, float *vy)
 {
@@ -741,7 +855,7 @@ static donut_move_result_t DonutMove_Task(
   {
     donut_surface_candidate_tick = 0U;
     move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
-    return DONUT_MOVE_ERROR;
+    return DONUT_MOVE_RUNNING;
   }
 
   uint16_t tof_distance_mm = get_selected_donut_tof();
@@ -749,7 +863,7 @@ static donut_move_result_t DonutMove_Task(
   {
     donut_surface_candidate_tick = 0U;
     move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
-    return DONUT_MOVE_ERROR;
+    return DONUT_MOVE_RUNNING;
   }
 
   int32_t surface_error = (int32_t)tof_distance_mm -
@@ -990,8 +1104,8 @@ static bool point_align_update(uint32_t now)
       line_right_white_sigma,
       line_right_green_mean,
       line_right_green_sigma,
-      NULL,
-      NULL,
+      line_right_red_mean,
+      line_right_red_sigma,
       &right);
 
   if (!front.valid || !right.valid)
@@ -1127,7 +1241,7 @@ void AutoControl_Task(void)
       }
 
       /* The front line is centered; now approach the intersection forward. */
-      move_degree(0.0f, 0.0f, 1.0f, POINT_SEARCH_POWER);
+      point_search_move(0.0f, 0.0f, 1.0f);
 
       if (point_event)
       {
@@ -1144,8 +1258,8 @@ void AutoControl_Task(void)
       if ((now - auto_state_tick) > POINT_ALIGN_TIMEOUT_MS)
       {
         move_degree(0.0f, 0.0f, 0.0f, 0.0f);
-        auto_control_error = true;
-        auto_state = AUTO_STATE_ERROR;
+        point_align_reset();
+        auto_state_tick = now;
         break;
       }
 
@@ -1179,6 +1293,18 @@ void AutoControl_Task(void)
     case AUTO_STATE_MOVE_TO_DONUT:
       point_detection_enabled = false;
       arm_vertical_command = 0.0f;
+
+      /* Raspberry Pi delivery can pause.  Wait safely for a fresh, nonzero
+       * TOF value and resume automatically instead of latching ERROR. */
+      if ((tof_last_update_tick == 0U) ||
+          ((now - tof_last_update_tick) > DONUT_TOF_STALE_MS) ||
+          (get_selected_donut_tof() == 0U))
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        donut_surface_candidate_tick = 0U;
+        auto_state_tick = now;
+        break;
+      }
 
       if ((now - auto_state_tick) > DONUT_MOVE_TIMEOUT_MS)
       {
@@ -1237,13 +1363,13 @@ void AutoControl_Task(void)
       if (limit_bottom)
       {
         arm_vertical_command = 0.0f;
-        auto_state = AUTO_STATE_DONUT_REACHED;
+        arm_gripper_command = 0.0f;
+        gripper_hold_candidate_tick = 0U;
+        auto_state = AUTO_STATE_CLOSE_ARM;
         break;
       }
 
-      if ((limit_last_update_tick == 0U) ||
-          ((now - limit_last_update_tick) > ARM_LIMIT_STALE_MS) ||
-          ((now - auto_state_tick) > ARM_LOWER_TIMEOUT_MS))
+      if (limit_last_update_tick == 0U)
       {
         arm_vertical_command = 0.0f;
         auto_control_error = true;
@@ -1251,21 +1377,282 @@ void AutoControl_Task(void)
         break;
       }
 
-      /* Motor 6: +700 means down; ArmVertical_Move applies the bottom limit. */
+      HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, SET);
+      
+      /* Motor 6: positive power means down; stop at the bottom limit. */
       arm_vertical_command = ARM_LOWER_POWER;
+      break;
+
+    case AUTO_STATE_CLOSE_ARM:
+      point_detection_enabled = false;
+      move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+      arm_vertical_command = 0.0f;
+
+      /* The second value displayed by GET TOF is TOF_hall.  Before gripping
+       * it is about 95-98 mm; a held donut is about 80-83 mm. */
+      if ((tof_last_update_tick == 0U) || (TOF_hall == 0U))
+      {
+        arm_gripper_command = 0.0f;
+        gripper_hold_candidate_tick = 0U;
+        break;
+      }
+
+      if (TOF_hall <= ARM_GRIPPER_HOLD_TOF_MM)
+      {
+        /* Stop immediately at the measured holding distance, then require
+         * the value to remain there briefly before completing the state. */
+        arm_gripper_command = 0.0f;
+
+        if (gripper_hold_candidate_tick == 0U)
+        {
+          gripper_hold_candidate_tick = now;
+        }
+
+        if ((now - gripper_hold_candidate_tick) >= ARM_GRIPPER_CONFIRM_MS)
+        {
+          auto_state = AUTO_STATE_DONUT_REACHED;
+        }
+        break;
+      }
+
+      gripper_hold_candidate_tick = 0U;
+      arm_gripper_command = -ARM_GRIPPER_CLOSE_POWER;
       break;
 
     case AUTO_STATE_DONUT_REACHED:
       point_detection_enabled = false;
       arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+      move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+      auto_state_tick = now;
+      auto_state = AUTO_STATE_RAISE_ARM_HALF;
+      break;
+
+    case AUTO_STATE_RAISE_ARM_HALF:
+      point_detection_enabled = false;
+      arm_gripper_command = 0.0f;
+      move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+
+      /* There is no arm-position sensor between the two limit switches, so
+       * the half-height position is time based.  The top limit remains an
+       * independent safety stop in ArmVertical_Move(). */
+      if (limit_top ||
+          ((now - auto_state_tick) >= ARM_HALF_RAISE_MS))
+      {
+        arm_vertical_command = 0.0f;
+        point_arrived = false;
+        route_depart_clear_tick = 0U;
+        route_final_forward_point_count = 0U;
+        point_align_reset();
+        PointDetect_Reset();
+        point_detection_enabled = false;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_LEAVE_DONUT_POINT;
+        break;
+      }
+
+      arm_vertical_command = -ARM_STARTUP_HOME_POWER;
+      break;
+
+    case AUTO_STATE_ROUTE_LEAVE_DONUT_POINT:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      /* Leave the pickup intersection before arming point detection.  If the
+       * detector were reset while still centered on this point, the same
+       * intersection could be counted as the next one. */
+      move_degree(target_body_degree, 0.0f, 1.0f, POINT_SEARCH_POWER);
+
+      if (point_candidate_is_present())
+      {
+        route_depart_clear_tick = 0U;
+        break;
+      }
+
+      if (route_depart_clear_tick == 0U)
+      {
+        route_depart_clear_tick = now;
+      }
+
+      if ((now - route_depart_clear_tick) >= POINT_REARM_CLEAR_MS)
+      {
+        PointDetect_Reset();
+        point_detection_enabled = true;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_FORWARD_TO_POINT;
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_FORWARD_TO_POINT:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > POINT_SEARCH_TIMEOUT_MS)
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      point_search_move(target_body_degree, 0.0f, 1.0f);
+
+      if (point_event)
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        point_align_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_ALIGN_FORWARD_POINT;
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_ALIGN_FORWARD_POINT:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > ROUTE_ALIGN_TIMEOUT_MS)
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        current_point_index++;
+        point_align_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_LEFT_TO_POINT;
+        break;
+      }
+
+      if (point_align_update(now))
+      {
+        current_point_index++;
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_LEFT_TO_POINT;
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_LEFT_TO_POINT:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > POINT_SEARCH_TIMEOUT_MS)
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      point_search_move(target_body_degree, -1.0f, 0.0f);
+
+      if (point_event)
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        point_align_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_ALIGN_LEFT_POINT;
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_ALIGN_LEFT_POINT:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > ROUTE_ALIGN_TIMEOUT_MS)
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        current_point_index++;
+        route_final_forward_point_count = 0U;
+        point_align_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_FORWARD_COUNT_POINTS;
+        break;
+      }
+
+      if (point_align_update(now))
+      {
+        current_point_index++;
+        route_final_forward_point_count = 0U;
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_FORWARD_COUNT_POINTS;
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_FORWARD_COUNT_POINTS:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > POINT_SEARCH_TIMEOUT_MS)
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      /* Continue forward and stop at the third following intersection. */
+      point_search_move(target_body_degree, 0.0f, 1.0f);
+
+      if (point_event)
+      {
+        route_final_forward_point_count++;
+        current_point_index++;
+        auto_state_tick = now;
+
+        if (route_final_forward_point_count >= ROUTE_FINAL_FORWARD_POINTS)
+        {
+          move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+          point_align_reset();
+          auto_state = AUTO_STATE_ROUTE_ALIGN_FINAL_POINT;
+        }
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_ALIGN_FINAL_POINT:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > ROUTE_ALIGN_TIMEOUT_MS)
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        point_arrived = true;
+        point_detection_enabled = false;
+        point_align_reset();
+        auto_state = AUTO_STATE_ROUTE_COMPLETE;
+        break;
+      }
+
+      if (point_align_update(now))
+      {
+        point_arrived = true;
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        point_detection_enabled = false;
+        auto_state = AUTO_STATE_ROUTE_COMPLETE;
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_COMPLETE:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
       move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
       break;
 
     case AUTO_STATE_ERROR:
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
       move_degree(0.0f, 0.0f, 0.0f, 0.0f);
       break;
 
     default:
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
       move_degree(0.0f, 0.0f, 0.0f, 0.0f);
       auto_control_error = true;
       auto_state = AUTO_STATE_ERROR;
@@ -1438,8 +1825,40 @@ int main(void)
     /* USER CODE BEGIN 3 */
     CDC_Protocol_Task();
     PointDetect_Task();
-    AutoControl_Task();
+
+    /* Home the arm to the top limit before allowing the drive flow to start. */
+    if (!arm_startup_home_done)
+    {
+      (void)ArmStartupHome_Task();
+    }
+    else
+    {
+      AutoControl_Task();
+    }
+
     ArmVertical_Move(arm_vertical_command);
+    ArmGripper_Move(arm_gripper_command);
+
+    // if(TOF_arm > 50){
+    //   HAL_GPIO_WritePin(LED_B_GPIO_Port, LED_B_Pin, SET);
+    // }
+    // else{
+    //   HAL_GPIO_WritePin(LED_B_GPIO_Port, LED_B_Pin, RESET);
+    // }
+
+    // if(TOF_hall > 50){
+    //   HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, SET);
+    // }
+    // else{
+    //   HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, RESET);
+    // }
+
+    // if(limit_bottom | limit_top){
+    //   HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, SET);
+    // }
+    // else{
+    //   HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, RESET);
+    // }
 
     /* RGB LED is reserved for line geometry debugging. */
     LineDebugLED_Task();
