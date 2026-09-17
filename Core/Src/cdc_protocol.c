@@ -32,6 +32,38 @@ static void send_text(const char *text)
     (void)CDC_Transmit_FS((uint8_t *)text, (uint16_t)strlen(text));
 }
 
+/*
+ * newlib-nano does not format floating-point values with printf unless the
+ * comparatively large _printf_float support is linked.  Convert the BNO055
+ * angles to centidegrees here so GET IMU always returns two decimal places.
+ */
+static int32_t angle_to_centidegrees(float angle)
+{
+    float scaled = angle * 100.0f;
+    return (int32_t)(scaled + ((scaled >= 0.0f) ? 0.5f : -0.5f));
+}
+
+static void send_imu_euler(const bno055_euler_t *euler)
+{
+    int32_t roll = angle_to_centidegrees(euler->roll);
+    int32_t pitch = angle_to_centidegrees(euler->pitch);
+    int32_t yaw = angle_to_centidegrees(euler->yaw);
+    unsigned long roll_abs = (unsigned long)((roll < 0) ? -roll : roll);
+    unsigned long pitch_abs = (unsigned long)((pitch < 0) ? -pitch : pitch);
+    unsigned long yaw_abs = (unsigned long)((yaw < 0) ? -yaw : yaw);
+
+    snprintf(
+        tx_buf,
+        sizeof(tx_buf),
+        "IMU %s%lu.%02lu %s%lu.%02lu %s%lu.%02lu\r\n",
+        (roll < 0) ? "-" : "", roll_abs / 100UL, roll_abs % 100UL,
+        (pitch < 0) ? "-" : "", pitch_abs / 100UL, pitch_abs % 100UL,
+        (yaw < 0) ? "-" : "", yaw_abs / 100UL, yaw_abs % 100UL
+    );
+
+    send_text(tx_buf);
+}
+
 void CDC_Protocol_Task(void)
 {
     if (!cmd_ready)
@@ -62,19 +94,7 @@ void CDC_Debug_Task(void)
     if (err != BNO_OK)
         return;
 
-    int len = snprintf(
-        tx_buf,
-        sizeof(tx_buf),
-        "IMU %.2f %.2f %.2f\r\n",
-        euler.roll,
-        euler.pitch,
-        euler.yaw
-    );
-
-    if (len > 0)
-    {
-        (void)CDC_Transmit_FS((uint8_t *)tx_buf, (uint16_t)len);
-    }
+    send_imu_euler(&euler);
 
     #endif
 
@@ -222,16 +242,18 @@ void CDC_Protocol_Process(char *rx)
             return;
         }
 
-        TOF_arm = (uint16_t)value2;
+        /* Protocol order is fixed as: SEND TOF <HALL> <ARM>.
+         * HALL measures arm height; ARM measures gripper opening. */
         TOF_hall = (uint16_t)value1;
+        TOF_arm = (uint16_t)value2;
         tof_last_update_tick = HAL_GetTick();
-        snprintf(tx_buf, sizeof(tx_buf), "OK TOF %u %u\r\n", (unsigned int)TOF_arm, (unsigned int)TOF_hall);
+        snprintf(tx_buf, sizeof(tx_buf), "OK TOF %u %u\r\n", (unsigned int)TOF_hall, (unsigned int)TOF_arm);
         send_text(tx_buf);
     }
     else if (strcmp(rx, "GET TOF") == 0)
     {
         snprintf(tx_buf, sizeof(tx_buf), "TOF %u %u\r\n",
-                 (unsigned int)TOF_arm, (unsigned int)TOF_hall);
+                 (unsigned int)TOF_hall, (unsigned int)TOF_arm);
         send_text(tx_buf);
     }
     else if ((sscanf(rx, "SEND LIMIT %u %u", &value1, &value2) == 2))
@@ -307,44 +329,31 @@ void CDC_Protocol_Process(char *rx)
 
     //     #endif
     // }
-    // else if (strcmp(rx, "GET IMU") == 0){
-    //     #if USE_BNO055
-    //         bno055_euler_t euler;
+    else if (strcmp(rx, "GET IMU") == 0){
+            bno055_euler_t euler;
 
-    //         error_bno err = bno055_euler(
-    //             &bno,
-    //             &euler
-    //         );
+            error_bno err = bno055_euler(
+                &bno,
+                &euler
+            );
 
-    //         if (err == BNO_OK)
-    //         {
-    //             snprintf(
-    //                 tx_buf,
-    //                 sizeof(tx_buf),
-    //                 "IMU %.2f %.2f %.2f\r\n",
-    //                 euler.roll,
-    //                 euler.pitch,
-    //                 euler.yaw
-    //             );
+            if (err == BNO_OK)
+            {
+                send_imu_euler(&euler);
+            }
+            else
+            {
+                snprintf(
+                    tx_buf,
+                    sizeof(tx_buf),
+                    "ERR IMU %s\r\n",
+                    bno055_err_str(err)
+                );
 
-    //             send_text(tx_buf);
-    //         }
-    //         else
-    //         {
-    //             snprintf(
-    //                 tx_buf,
-    //                 sizeof(tx_buf),
-    //                 "ERR IMU %s\r\n",
-    //                 bno055_err_str(err)
-    //             );
+                send_text(tx_buf);
+            }
 
-    //             send_text(tx_buf);
-    //         }
-    //     #else
-    //         send_text("ERR BNO055 DISABLED\r\n");
-    //         return;
-    //     #endif
-    // }
+    }
     // else if (strcmp(rx, "GET LIMIT") == 0) {
     //     #if USE_LIMIT_SW
     //         snprintf(tx_buf, sizeof(tx_buf), "LIMIT %d %d\r\n", HAL_GPIO_ReadPin(Limit_SW_1_GPIO_Port, Limit_SW_1_Pin), HAL_GPIO_ReadPin(Limit_SW_2_GPIO_Port, Limit_SW_2_Pin));

@@ -66,14 +66,58 @@
 #define DONUT_MIN_DISTANCE_DROP_MM 30U
 #define DONUT_MOVE_TIMEOUT_MS     10000U
 #define DONUT_GUIDE_APPROACH_POWER 650.0f
-#define DONUT_GUIDE_APPROACH_MS    700U
+#define DONUT_GUIDE_APPROACH_MS    1200U
 #define ARM_LOWER_POWER            900.0f
 #define ARM_STARTUP_HOME_POWER     850.0f
-#define ARM_GRIPPER_CLOSE_POWER    600.0f
-#define ARM_GRIPPER_HOLD_TOF_MM     87U
-#define ARM_GRIPPER_CONFIRM_MS      100U
-#define ARM_HALF_RAISE_MS          1200U
+#define ARM_GRIPPER_CLOSE_POWER    700.0f
+#define ARM_GRIPPER_HOLD_TOF_MM     75U
+#define ARM_GRIPPER_CONFIRM_MS      95U
+#define ARM_GRIPPER_HYSTERESIS_MM     5U
+#define ARM_GRIPPER_TOF_STALE_MS     600U
+#define ARM_GRIPPER_CLOSE_TIMEOUT_MS 5000U
+#define ARM_GRIPPER_OPEN_POWER       700.0f
+#define ARM_GRIPPER_OPEN_TOF_MM      95U
+#define ARM_GRIPPER_OPEN_CONFIRM_MS  100U
+#define ARM_GRIPPER_OPEN_TIMEOUT_MS 5000U
+#define ARM_HALF_RAISE_MS          3000U
 #define ROUTE_FINAL_FORWARD_POINTS    3U
+#define ROUTE_P5_TO_P7_POINTS          2U
+#define LINE_TRACE_POWER            700.0f
+#define LINE_TRACE_MAX_CORRECTION     0.10f
+#define LINE_TRACE_CONTROL_PERIOD_MS  10U
+#define BODY_TURN_MIN_PWM            600.0f
+#define BODY_TURN_MAX_PWM            750.0f
+#define BODY_TURN_TOLERANCE_DEG        5.0f
+#define BODY_TURN_STABLE_MS          250U
+#define BODY_TURN_TIMEOUT_MS        8000U
+#define BRIDGE_IMU_SAMPLE_MS          20U
+#define BRIDGE_SLOPE_ENTER_DEG         8.0f
+#define BRIDGE_FLAT_RETURN_DEG          4.0f
+#define BRIDGE_SLOPE_CONFIRM_MS       250U
+#define BRIDGE_FLAT_CONFIRM_MS        400U
+#define BRIDGE_TOP_FORWARD_MS        200U
+#define BRIDGE_STOP_BEFORE_TURN_MS    300U
+#define BRIDGE_STAGE_TIMEOUT_MS     20000U
+#define P8_ARM_RAISE_TIMEOUT_MS     10000U
+#define P8_LIMIT_STALE_MS            1000U
+#define P8_FORWARD_TRACE_MS          3000U
+#define P8_PREOPEN_REVERSE_MS         100U
+#define P8_PREOPEN_REVERSE_POWER    700.0f
+#define P9_DIAGONAL_COMPONENT          0.5f
+#define P9_ALIGN_TIMEOUT_MS           3000U
+#define P9_EARLY_LINE_IGNORE_MS       5000U
+#define P9_FRONT_LINE_CONFIRM_MS       600U
+
+/* Set to 0 to restore the legacy 3.5 / 3.5 sensor-center targets. */
+#define USE_MEASURED_LINE_CENTERS        0U
+#if USE_MEASURED_LINE_CENTERS
+#define FRONT_LINE_CENTER_POSITION      4.0f
+#define RIGHT_LINE_CENTER_POSITION      3.4f
+#else
+#define FRONT_LINE_CENTER_POSITION      3.5f
+#define RIGHT_LINE_CENTER_POSITION      3.5f
+#endif
+
 #define LINE_RED_SIGMA_FLOOR       20.0f
 #define ENABLE_ARM_VERTICAL       1U
 #define POINT_SEARCH_TIMEOUT_MS   10000U
@@ -162,6 +206,10 @@ volatile uint16_t donut_floor_distance_mm = 430U;
 volatile uint16_t donut_surface_distance_mm = 380U;
 volatile uint16_t donut_tof_tolerance_mm = DONUT_TOF_TOLERANCE_MM;
 
+/* Physical TOF roles and CDC order: TOF <HALL> <ARM>.
+ *   TOF_hall = arm height / downward floor-donut distance
+ *   TOF_arm  = gripper opening/holding distance
+ */
 /* 0 = TOF_arm, 1 = TOF_hall. */
 volatile uint8_t donut_tof_source = 1;
 
@@ -182,6 +230,11 @@ float point_align_I_gain_x = 0.0f;
 float point_align_I_gain_y = 0.0f;
 float point_align_D_gain_x = 0.0f;
 float point_align_D_gain_y = 0.0f;
+/* Front-line PID output is robot-relative vx while vy is fixed forward/back. */
+float line_trace_P_gain = 0.06f;
+float line_trace_I_gain = 0.0f;
+float line_trace_D_gain = 0.0f;
+float body_turn_P_gain = 20.0f;
 float PID_err = 0.0;
 float PID_err_old = 0.0;
 float degree_old = 0.0;
@@ -725,6 +778,196 @@ static void start_motor_pwm(void)
   }
 }
 
+/* The front sensor is perpendicular to the travel line.  Its PID output is a
+ * small mecanum vx correction; keeping it below 0.10 leaves every wheel near
+ * the 600-PWM region needed by the motor drivers while vy is +/-1. */
+static float line_trace_integral = 0.0f;
+static float line_trace_previous_error = 0.0f;
+static float line_trace_correction = 0.0f;
+static uint32_t line_trace_last_sample_tick = 0U;
+
+static void line_trace_reset(void)
+{
+  line_trace_integral = 0.0f;
+  line_trace_previous_error = 0.0f;
+  line_trace_correction = 0.0f;
+  line_trace_last_sample_tick = 0U;
+}
+
+static bool line_trace_move(float body_degree, float vy)
+{
+  uint32_t now = HAL_GetTick();
+  uint32_t sample_tick = line_adc_center_last_update_tick;
+  line_sensor_position_t front;
+
+  if ((sample_tick == 0U) ||
+      ((now - sample_tick) > LINE_CENTER_STALE_MS))
+  {
+    line_trace_reset();
+    move_degree(body_degree, 0.0f, 0.0f, 0.0f);
+    return false;
+  }
+
+  get_line_sensor_position(
+      line_adc_center,
+      line_front_white_mean,
+      line_front_white_sigma,
+      line_front_green_mean,
+      line_front_green_sigma,
+      line_front_red_mean,
+      line_front_red_sigma,
+      &front);
+
+  if (!front.valid)
+  {
+    line_trace_reset();
+    move_degree(body_degree, 0.0f, 0.0f, 0.0f);
+    return false;
+  }
+
+  /* Update PID once per newly received sensor packet. */
+  if (sample_tick != line_trace_last_sample_tick)
+  {
+    float error = FRONT_LINE_CENTER_POSITION - front.position;
+    float dt = (line_trace_last_sample_tick == 0U) ?
+               ((float)LINE_TRACE_CONTROL_PERIOD_MS / 1000.0f) :
+               ((float)(sample_tick - line_trace_last_sample_tick) / 1000.0f);
+    if (dt < 0.001f)
+    {
+      dt = 0.001f;
+    }
+
+    line_trace_integral += error * dt;
+    line_trace_integral = limit_float(line_trace_integral, -3.0f, 3.0f);
+
+    float derivative = (line_trace_last_sample_tick == 0U) ?
+                       0.0f :
+                       ((error - line_trace_previous_error) / dt);
+
+    line_trace_correction =
+        (line_trace_P_gain * error) +
+        (line_trace_I_gain * line_trace_integral) +
+        (line_trace_D_gain * derivative);
+    line_trace_correction = limit_float(
+        line_trace_correction,
+        -LINE_TRACE_MAX_CORRECTION,
+        LINE_TRACE_MAX_CORRECTION);
+
+    line_trace_previous_error = error;
+    line_trace_last_sample_tick = sample_tick;
+  }
+
+  move_degree(
+      body_degree,
+      line_trace_correction,
+      (vy >= 0.0f) ? 1.0f : -1.0f,
+      LINE_TRACE_POWER);
+  return true;
+}
+
+/* Stop on the first intersection candidate so the existing 300-ms point
+ * confirmation can finish without the chassis crossing the whole point. */
+static bool line_trace_point_search(float body_degree, float vy)
+{
+  if (point_state == POINT_STATE_CANDIDATE)
+  {
+    line_trace_reset();
+    move_degree(body_degree, 0.0f, 0.0f, 0.0f);
+    return true;
+  }
+
+  return line_trace_move(body_degree, vy);
+}
+
+static uint32_t body_turn_stable_tick = 0U;
+static uint32_t body_turn_last_control_tick = 0U;
+
+static void body_turn_reset(void)
+{
+  body_turn_stable_tick = 0U;
+  body_turn_last_control_tick = 0U;
+  stop_drive_motors();
+}
+
+/* In-place yaw turn with enough minimum PWM to start all four drive motors. */
+static bool body_turn_update(float target_degree, uint32_t now)
+{
+  if ((body_turn_last_control_tick != 0U) &&
+      ((now - body_turn_last_control_tick) < MOVE_CONTROL_PERIOD_MS))
+  {
+    return false;
+  }
+  body_turn_last_control_tick = now;
+
+  bno055_euler_t euler;
+  if (bno055_euler(&bno, &euler) != BNO_OK)
+  {
+    body_turn_stable_tick = 0U;
+    stop_drive_motors();
+    return false;
+  }
+
+  float error = normalize_degree(target_degree - euler.yaw);
+  if (fabsf(error) <= BODY_TURN_TOLERANCE_DEG)
+  {
+    stop_drive_motors();
+    if (body_turn_stable_tick == 0U)
+    {
+      body_turn_stable_tick = now;
+    }
+    return (now - body_turn_stable_tick) >= BODY_TURN_STABLE_MS;
+  }
+
+  body_turn_stable_tick = 0U;
+  float turn_pwm = fabsf(body_turn_P_gain * error);
+  turn_pwm = limit_float(turn_pwm, BODY_TURN_MIN_PWM, BODY_TURN_MAX_PWM);
+  if (error < 0.0f)
+  {
+    turn_pwm = -turn_pwm;
+  }
+
+  /* Same rotation signs as move_degree(): positive error is positive yaw. */
+  set_motor_pwm(&htim1, TIM_CHANNEL_2, TIM_CHANNEL_1, -turn_pwm); /* M1 RR */
+  set_motor_pwm(&htim3, TIM_CHANNEL_4, TIM_CHANNEL_3,  turn_pwm); /* M2 RL */
+  set_motor_pwm(&htim3, TIM_CHANNEL_2, TIM_CHANNEL_1,  turn_pwm); /* M3 FL */
+  set_motor_pwm(&htim2, TIM_CHANNEL_4, TIM_CHANNEL_3, -turn_pwm); /* M4 FR */
+  return false;
+}
+
+static uint32_t bridge_imu_last_sample_tick = 0U;
+static float bridge_last_pitch = 0.0f;
+static bool bridge_pitch_sample_valid = false;
+
+static void bridge_imu_reset(void)
+{
+  bridge_imu_last_sample_tick = 0U;
+  bridge_last_pitch = 0.0f;
+  bridge_pitch_sample_valid = false;
+}
+
+static bool bridge_sample_pitch(uint32_t now, float *pitch)
+{
+  if (bridge_pitch_sample_valid &&
+      ((now - bridge_imu_last_sample_tick) < BRIDGE_IMU_SAMPLE_MS))
+  {
+    *pitch = bridge_last_pitch;
+    return true;
+  }
+
+  bno055_euler_t euler;
+  if (bno055_euler(&bno, &euler) != BNO_OK)
+  {
+    bridge_pitch_sample_valid = false;
+    return false;
+  }
+
+  bridge_last_pitch = euler.pitch;
+  bridge_imu_last_sample_tick = now;
+  bridge_pitch_sample_valid = true;
+  *pitch = bridge_last_pitch;
+  return true;
+}
+
 /*
  * Move the mecanum base while holding body_degree with the BNO055 yaw.
  *
@@ -760,6 +1003,34 @@ typedef enum
   AUTO_STATE_ROUTE_ALIGN_LEFT_POINT,
   AUTO_STATE_ROUTE_FORWARD_COUNT_POINTS,
   AUTO_STATE_ROUTE_ALIGN_FINAL_POINT,
+  AUTO_STATE_ROUTE_TURN_RIGHT_AT_P5,
+  AUTO_STATE_ROUTE_LEAVE_P5,
+  AUTO_STATE_ROUTE_TRACE_TO_P7,
+  AUTO_STATE_ROUTE_LEAVE_P7,
+  AUTO_STATE_BRIDGE_FIND_UP_SLOPE,
+  AUTO_STATE_BRIDGE_FIND_CREST,
+  AUTO_STATE_BRIDGE_TOP_FORWARD,
+  AUTO_STATE_BRIDGE_STOP_BEFORE_TURN,
+  AUTO_STATE_BRIDGE_TURN_180,
+  AUTO_STATE_BRIDGE_REVERSE_FIND_SLOPE,
+  AUTO_STATE_BRIDGE_REVERSE_FIND_FLAT,
+  AUTO_STATE_ROUTE_REVERSE_TO_P8,
+  AUTO_STATE_ROUTE_ALIGN_P8,
+  AUTO_STATE_P8_TURN_180,
+  AUTO_STATE_P8_RAISE_ARM_TOP,
+  AUTO_STATE_P8_FORWARD_TRACE,
+  AUTO_STATE_P8_PREOPEN_REVERSE,
+  AUTO_STATE_P8_OPEN_ARM,
+  AUTO_STATE_P8_REVERSE_TO_POINT,
+  AUTO_STATE_P8_FINAL_ALIGN,
+  AUTO_STATE_P8_LEAVE_RIGHT,
+  AUTO_STATE_P8_RIGHT_TO_P9,
+  AUTO_STATE_P9_ALIGN,
+  AUTO_STATE_P9_DIAGONAL_LEAVE,
+  AUTO_STATE_P9_DIAGONAL_FIND_LINE,
+  AUTO_STATE_P9_REVERSE_TRACE_REARM,
+  AUTO_STATE_P9_REVERSE_TO_P10,
+  AUTO_STATE_P10_FINAL_ALIGN,
   AUTO_STATE_ROUTE_COMPLETE,
   AUTO_STATE_ERROR
 } auto_state_t;
@@ -776,8 +1047,15 @@ static float point_align_previous_y = 0.0f;
 static uint32_t point_align_last_tick = 0U;
 static uint32_t donut_surface_candidate_tick = 0U;
 static uint32_t gripper_hold_candidate_tick = 0U;
+static uint32_t gripper_open_candidate_tick = 0U;
 static uint32_t route_depart_clear_tick = 0U;
+static uint32_t p9_diagonal_start_tick = 0U;
 static uint8_t route_final_forward_point_count = 0U;
+static uint8_t route_p5_to_p7_point_count = 0U;
+static float bridge_flat_pitch = 0.0f;
+static bool bridge_flat_pitch_valid = false;
+static uint32_t bridge_slope_candidate_tick = 0U;
+static uint32_t bridge_flat_candidate_tick = 0U;
 
 static void apply_minimum_motion_vector(float *vx, float *vy)
 {
@@ -941,7 +1219,7 @@ static bool front_line_raw_is_present(void)
  * change state.  This prevents a single noisy CDC packet from immediately
  * entering AUTO_STATE_ALIGN_FRONT_LINE.
  */
-static bool front_line_is_present(void)
+static bool front_line_is_present_for(uint32_t confirm_ms)
 {
   uint32_t now = HAL_GetTick();
 
@@ -956,7 +1234,12 @@ static bool front_line_is_present(void)
     front_line_detect_candidate_tick = now;
   }
 
-  return (now - front_line_detect_candidate_tick) >= FRONT_LINE_CONFIRM_MS;
+  return (now - front_line_detect_candidate_tick) >= confirm_ms;
+}
+
+static bool front_line_is_present(void)
+{
+  return front_line_is_present_for(FRONT_LINE_CONFIRM_MS);
 }
 
 /*
@@ -1040,7 +1323,7 @@ static bool front_line_align_update(uint32_t now)
       &front);
 
   /* Front S0 is right and S7 is left: positive error means move right. */
-  float error_x = 3.5f - front.position;
+  float error_x = FRONT_LINE_CENTER_POSITION - front.position;
 
   if (fabsf(error_x) <= POINT_ALIGN_ERROR_X)
   {
@@ -1116,10 +1399,10 @@ static bool point_align_update(uint32_t now)
   }
 
   /* Front S0 is right and S7 is left: positive error means move right. */
-  float error_x = 3.5f - front.position;
+  float error_x = FRONT_LINE_CENTER_POSITION - front.position;
 
   /* Right S0 is rear/lower and S7 is front/upper: positive means move forward. */
-  float error_y = right.position - 3.5f;
+  float error_y = right.position - RIGHT_LINE_CENTER_POSITION;
 
   float dt = (point_align_last_tick == 0U) ?
              0.01f : ((float)(now - point_align_last_tick) / 1000.0f);
@@ -1365,6 +1648,7 @@ void AutoControl_Task(void)
         arm_vertical_command = 0.0f;
         arm_gripper_command = 0.0f;
         gripper_hold_candidate_tick = 0U;
+        auto_state_tick = now;
         auto_state = AUTO_STATE_CLOSE_ARM;
         break;
       }
@@ -1388,24 +1672,37 @@ void AutoControl_Task(void)
       move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
       arm_vertical_command = 0.0f;
 
-      /* The second value displayed by GET TOF is TOF_hall.  Before gripping
-       * it is about 95-98 mm; a held donut is about 80-83 mm. */
-      if ((tof_last_update_tick == 0U) || (TOF_hall == 0U))
+      /* GET TOF order is "TOF <HALL> <ARM>".  Gripping uses the second
+       * (ARM) value.  Never continue closing on missing or stale data. */
+      if ((now - auto_state_tick) >= ARM_GRIPPER_CLOSE_TIMEOUT_MS)
+      {
+        arm_gripper_command = 0.0f;
+        gripper_hold_candidate_tick = 0U;
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      if ((tof_last_update_tick == 0U) ||
+          ((now - tof_last_update_tick) > ARM_GRIPPER_TOF_STALE_MS) ||
+          (TOF_arm == 0U))
       {
         arm_gripper_command = 0.0f;
         gripper_hold_candidate_tick = 0U;
         break;
       }
 
-      if (TOF_hall <= ARM_GRIPPER_HOLD_TOF_MM)
+      if (gripper_hold_candidate_tick != 0U)
       {
-        /* Stop immediately at the measured holding distance, then require
-         * the value to remain there briefly before completing the state. */
+        /* Keep the motor stopped while confirming.  Small rebound/noise up to
+         * HOLD+HYSTERESIS must not restart the close motor. */
         arm_gripper_command = 0.0f;
 
-        if (gripper_hold_candidate_tick == 0U)
+        if (TOF_arm >
+            (ARM_GRIPPER_HOLD_TOF_MM + ARM_GRIPPER_HYSTERESIS_MM))
         {
-          gripper_hold_candidate_tick = now;
+          gripper_hold_candidate_tick = 0U;
+          break;
         }
 
         if ((now - gripper_hold_candidate_tick) >= ARM_GRIPPER_CONFIRM_MS)
@@ -1415,7 +1712,15 @@ void AutoControl_Task(void)
         break;
       }
 
-      gripper_hold_candidate_tick = 0U;
+      if (TOF_arm <= ARM_GRIPPER_HOLD_TOF_MM)
+      {
+        /* Stop immediately at the first threshold crossing and start a
+         * latched confirmation interval. */
+        arm_gripper_command = 0.0f;
+        gripper_hold_candidate_tick = now;
+        break;
+      }
+
       arm_gripper_command = -ARM_GRIPPER_CLOSE_POWER;
       break;
 
@@ -1624,7 +1929,13 @@ void AutoControl_Task(void)
         point_arrived = true;
         point_detection_enabled = false;
         point_align_reset();
-        auto_state = AUTO_STATE_ROUTE_COMPLETE;
+        target_body_degree = normalize_degree(target_body_degree + 90.0f);
+        route_p5_to_p7_point_count = 0U;
+        bridge_flat_pitch_valid = false;
+        body_turn_reset();
+        line_trace_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_TURN_RIGHT_AT_P5;
         break;
       }
 
@@ -1633,6 +1944,936 @@ void AutoControl_Task(void)
         point_arrived = true;
         move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
         point_detection_enabled = false;
+        target_body_degree = normalize_degree(target_body_degree + 90.0f);
+        route_p5_to_p7_point_count = 0U;
+        bridge_flat_pitch_valid = false;
+        body_turn_reset();
+        line_trace_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_TURN_RIGHT_AT_P5;
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_TURN_RIGHT_AT_P5:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > BODY_TURN_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      if (body_turn_update(target_body_degree, now))
+      {
+        float pitch;
+        bridge_imu_reset();
+        if (!bridge_sample_pitch(now, &pitch))
+        {
+          break;
+        }
+
+        /* Capture the actual mounting offset while P5 is still flat. */
+        bridge_flat_pitch = pitch;
+        bridge_flat_pitch_valid = true;
+        route_depart_clear_tick = 0U;
+        PointDetect_Reset();
+        line_trace_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_LEAVE_P5;
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_LEAVE_P5:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > BRIDGE_STAGE_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      (void)line_trace_move(target_body_degree, 1.0f);
+
+      /* Do not arm the detector until the P5 intersection is behind us. */
+      if (point_candidate_is_present())
+      {
+        route_depart_clear_tick = 0U;
+        break;
+      }
+
+      if (route_depart_clear_tick == 0U)
+      {
+        route_depart_clear_tick = now;
+      }
+      if ((now - route_depart_clear_tick) >= POINT_REARM_CLEAR_MS)
+      {
+        PointDetect_Reset();
+        point_detection_enabled = true;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_TRACE_TO_P7;
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_TRACE_TO_P7:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > BRIDGE_STAGE_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      (void)line_trace_point_search(target_body_degree, 1.0f);
+
+      if (point_event)
+      {
+        route_p5_to_p7_point_count++;
+        current_point_index++;
+        auto_state_tick = now;
+
+        if (route_p5_to_p7_point_count >= ROUTE_P5_TO_P7_POINTS)
+        {
+          stop_drive_motors();
+          point_detection_enabled = false;
+          route_depart_clear_tick = 0U;
+          line_trace_reset();
+          auto_state = AUTO_STATE_ROUTE_LEAVE_P7;
+        }
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_LEAVE_P7:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > BRIDGE_STAGE_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      (void)line_trace_move(target_body_degree, 1.0f);
+
+      if (point_candidate_is_present())
+      {
+        route_depart_clear_tick = 0U;
+        break;
+      }
+
+      if (route_depart_clear_tick == 0U)
+      {
+        route_depart_clear_tick = now;
+      }
+      if ((now - route_depart_clear_tick) >= POINT_REARM_CLEAR_MS)
+      {
+        bridge_slope_candidate_tick = 0U;
+        bridge_flat_candidate_tick = 0U;
+        bridge_imu_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_BRIDGE_FIND_UP_SLOPE;
+      }
+      break;
+
+    case AUTO_STATE_BRIDGE_FIND_UP_SLOPE:
+    {
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if (!bridge_flat_pitch_valid ||
+          ((now - auto_state_tick) > BRIDGE_STAGE_TIMEOUT_MS))
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      (void)line_trace_move(target_body_degree, 1.0f);
+
+      float pitch;
+      if (!bridge_sample_pitch(now, &pitch))
+      {
+        bridge_slope_candidate_tick = 0U;
+        break;
+      }
+
+      if (fabsf(pitch - bridge_flat_pitch) >= BRIDGE_SLOPE_ENTER_DEG)
+      {
+        if (bridge_slope_candidate_tick == 0U)
+        {
+          bridge_slope_candidate_tick = now;
+        }
+        if ((now - bridge_slope_candidate_tick) >= BRIDGE_SLOPE_CONFIRM_MS)
+        {
+          bridge_flat_candidate_tick = 0U;
+          auto_state_tick = now;
+          auto_state = AUTO_STATE_BRIDGE_FIND_CREST;
+        }
+      }
+      else
+      {
+        bridge_slope_candidate_tick = 0U;
+      }
+      break;
+    }
+
+    case AUTO_STATE_BRIDGE_FIND_CREST:
+    {
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > BRIDGE_STAGE_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      (void)line_trace_move(target_body_degree, 1.0f);
+
+      float pitch;
+      if (!bridge_sample_pitch(now, &pitch))
+      {
+        bridge_flat_candidate_tick = 0U;
+        break;
+      }
+
+      if (fabsf(pitch - bridge_flat_pitch) <= BRIDGE_FLAT_RETURN_DEG)
+      {
+        if (bridge_flat_candidate_tick == 0U)
+        {
+          bridge_flat_candidate_tick = now;
+        }
+        if ((now - bridge_flat_candidate_tick) >= BRIDGE_FLAT_CONFIRM_MS)
+        {
+          auto_state_tick = now;
+          auto_state = AUTO_STATE_BRIDGE_TOP_FORWARD;
+        }
+      }
+      else
+      {
+        bridge_flat_candidate_tick = 0U;
+      }
+      break;
+    }
+
+    case AUTO_STATE_BRIDGE_TOP_FORWARD:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) >= BRIDGE_TOP_FORWARD_MS)
+      {
+        stop_drive_motors();
+        line_trace_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_BRIDGE_STOP_BEFORE_TURN;
+        break;
+      }
+
+      (void)line_trace_move(target_body_degree, 1.0f);
+      break;
+
+    case AUTO_STATE_BRIDGE_STOP_BEFORE_TURN:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      /* Hold all four drive PWMs at zero before changing the yaw target. */
+      stop_drive_motors();
+
+      if ((now - auto_state_tick) >= BRIDGE_STOP_BEFORE_TURN_MS)
+      {
+        target_body_degree = normalize_degree(target_body_degree + 180.0f);
+        body_turn_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_BRIDGE_TURN_180;
+      }
+      break;
+
+    case AUTO_STATE_BRIDGE_TURN_180:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > BODY_TURN_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      if (body_turn_update(target_body_degree, now))
+      {
+        bridge_slope_candidate_tick = 0U;
+        bridge_flat_candidate_tick = 0U;
+        bridge_imu_reset();
+        PointDetect_Reset();
+        line_trace_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_BRIDGE_REVERSE_FIND_SLOPE;
+      }
+      break;
+
+    case AUTO_STATE_BRIDGE_REVERSE_FIND_SLOPE:
+    {
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > BRIDGE_STAGE_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      (void)line_trace_move(target_body_degree, -1.0f);
+
+      float pitch;
+      if (!bridge_sample_pitch(now, &pitch))
+      {
+        bridge_slope_candidate_tick = 0U;
+        break;
+      }
+
+      if (fabsf(pitch - bridge_flat_pitch) >= BRIDGE_SLOPE_ENTER_DEG)
+      {
+        if (bridge_slope_candidate_tick == 0U)
+        {
+          bridge_slope_candidate_tick = now;
+        }
+        if ((now - bridge_slope_candidate_tick) >= BRIDGE_SLOPE_CONFIRM_MS)
+        {
+          bridge_flat_candidate_tick = 0U;
+          auto_state_tick = now;
+          auto_state = AUTO_STATE_BRIDGE_REVERSE_FIND_FLAT;
+        }
+      }
+      else
+      {
+        bridge_slope_candidate_tick = 0U;
+      }
+      break;
+    }
+
+    case AUTO_STATE_BRIDGE_REVERSE_FIND_FLAT:
+    {
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > BRIDGE_STAGE_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      (void)line_trace_move(target_body_degree, -1.0f);
+
+      float pitch;
+      if (!bridge_sample_pitch(now, &pitch))
+      {
+        bridge_flat_candidate_tick = 0U;
+        break;
+      }
+
+      if (fabsf(pitch - bridge_flat_pitch) <= BRIDGE_FLAT_RETURN_DEG)
+      {
+        if (bridge_flat_candidate_tick == 0U)
+        {
+          bridge_flat_candidate_tick = now;
+        }
+        if ((now - bridge_flat_candidate_tick) >= BRIDGE_FLAT_CONFIRM_MS)
+        {
+          PointDetect_Reset();
+          point_detection_enabled = true;
+          line_trace_reset();
+          auto_state_tick = now;
+          auto_state = AUTO_STATE_ROUTE_REVERSE_TO_P8;
+        }
+      }
+      else
+      {
+        bridge_flat_candidate_tick = 0U;
+      }
+      break;
+    }
+
+    case AUTO_STATE_ROUTE_REVERSE_TO_P8:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > BRIDGE_STAGE_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      (void)line_trace_point_search(target_body_degree, -1.0f);
+
+      if (point_event)
+      {
+        current_point_index++;
+        stop_drive_motors();
+        point_align_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_ROUTE_ALIGN_P8;
+      }
+      break;
+
+    case AUTO_STATE_ROUTE_ALIGN_P8:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > ROUTE_ALIGN_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        point_arrived = true;
+        point_detection_enabled = false;
+        point_align_reset();
+        target_body_degree = normalize_degree(target_body_degree + 180.0f);
+        body_turn_reset();
+        line_trace_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P8_TURN_180;
+        break;
+      }
+
+      if (point_align_update(now))
+      {
+        point_arrived = true;
+        stop_drive_motors();
+        point_detection_enabled = false;
+        target_body_degree = normalize_degree(target_body_degree + 180.0f);
+        body_turn_reset();
+        line_trace_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P8_TURN_180;
+      }
+      break;
+
+    case AUTO_STATE_P8_TURN_180:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > BODY_TURN_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      if (body_turn_update(target_body_degree, now))
+      {
+        stop_drive_motors();
+        point_arrived = false;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P8_RAISE_ARM_TOP;
+      }
+      break;
+
+    case AUTO_STATE_P8_RAISE_ARM_TOP:
+      point_detection_enabled = false;
+      arm_gripper_command = 0.0f;
+      stop_drive_motors();
+
+      /* Stop and wait if LIMIT delivery is interrupted.  Once packets resume,
+       * restart the active-movement timeout from zero. */
+      if ((limit_last_update_tick == 0U) ||
+          ((now - limit_last_update_tick) > P8_LIMIT_STALE_MS))
+      {
+        arm_vertical_command = 0.0f;
+        auto_state_tick = now;
+        break;
+      }
+
+      if (limit_top)
+      {
+        arm_vertical_command = 0.0f;
+        line_trace_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P8_FORWARD_TRACE;
+        break;
+      }
+
+      if ((now - auto_state_tick) > P8_ARM_RAISE_TIMEOUT_MS)
+      {
+        arm_vertical_command = 0.0f;
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      arm_vertical_command = -ARM_STARTUP_HOME_POWER;
+      break;
+
+    case AUTO_STATE_P8_FORWARD_TRACE:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      /* Count only time in which fresh front-line data actually permits
+       * movement, so a CDC pause cannot shorten the requested travel. */
+      if (!line_trace_move(target_body_degree, 1.0f))
+      {
+        auto_state_tick = now;
+        break;
+      }
+
+      if ((now - auto_state_tick) >= P8_FORWARD_TRACE_MS)
+      {
+        stop_drive_motors();
+        line_trace_reset();
+        gripper_open_candidate_tick = 0U;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P8_PREOPEN_REVERSE;
+      }
+      break;
+
+    case AUTO_STATE_P8_PREOPEN_REVERSE:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) >= P8_PREOPEN_REVERSE_MS)
+      {
+        stop_drive_motors();
+        gripper_open_candidate_tick = 0U;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P8_OPEN_ARM;
+        break;
+      }
+
+      /* Move the chassis straight backward briefly without changing yaw. */
+      move_degree(
+          target_body_degree,
+          0.0f,
+          -1.0f,
+          P8_PREOPEN_REVERSE_POWER);
+      break;
+
+    case AUTO_STATE_P8_OPEN_ARM:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      stop_drive_motors();
+
+      /* Gripper opening is also measured by the second (ARM) TOF value. */
+
+      if ((now - auto_state_tick) >= ARM_GRIPPER_OPEN_TIMEOUT_MS)
+      {
+        arm_gripper_command = 0.0f;
+        gripper_open_candidate_tick = 0U;
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      if ((tof_last_update_tick == 0U) ||
+          ((now - tof_last_update_tick) > ARM_GRIPPER_TOF_STALE_MS) ||
+          (TOF_arm == 0U))
+      {
+        arm_gripper_command = 0.0f;
+        gripper_open_candidate_tick = 0U;
+        break;
+      }
+
+      if (gripper_open_candidate_tick != 0U)
+      {
+        arm_gripper_command = 0.0f;
+
+        if (((uint32_t)TOF_arm + ARM_GRIPPER_HYSTERESIS_MM) <
+            ARM_GRIPPER_OPEN_TOF_MM)
+        {
+          gripper_open_candidate_tick = 0U;
+          break;
+        }
+
+        if ((now - gripper_open_candidate_tick) >=
+            ARM_GRIPPER_OPEN_CONFIRM_MS)
+        {
+          PointDetect_Reset();
+          point_detection_enabled = true;
+          line_trace_reset();
+          arm_gripper_command = 0.0f;
+          auto_state_tick = now;
+          auto_state = AUTO_STATE_P8_REVERSE_TO_POINT;
+        }
+        break;
+      }
+
+      if (TOF_arm >= ARM_GRIPPER_OPEN_TOF_MM)
+      {
+        arm_gripper_command = 0.0f;
+        gripper_open_candidate_tick = now;
+        break;
+      }
+
+      arm_gripper_command = ARM_GRIPPER_OPEN_POWER;
+      break;
+
+    case AUTO_STATE_P8_REVERSE_TO_POINT:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > BRIDGE_STAGE_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      (void)line_trace_point_search(target_body_degree, -1.0f);
+
+      if (point_event)
+      {
+        stop_drive_motors();
+        point_align_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P8_FINAL_ALIGN;
+      }
+      break;
+
+    case AUTO_STATE_P8_FINAL_ALIGN:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > ROUTE_ALIGN_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        point_arrived = true;
+        point_detection_enabled = false;
+        point_align_reset();
+        route_depart_clear_tick = 0U;
+        PointDetect_Reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P8_LEAVE_RIGHT;
+        break;
+      }
+
+      if (point_align_update(now))
+      {
+        point_arrived = true;
+        stop_drive_motors();
+        point_detection_enabled = false;
+        point_align_reset();
+        route_depart_clear_tick = 0U;
+        PointDetect_Reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P8_LEAVE_RIGHT;
+      }
+      break;
+
+    case AUTO_STATE_P8_LEAVE_RIGHT:
+      point_arrived = false;
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((line_adc_center_last_update_tick == 0U) ||
+          ((now - line_adc_center_last_update_tick) > LINE_CENTER_STALE_MS))
+      {
+        stop_drive_motors();
+        route_depart_clear_tick = 0U;
+        auto_state_tick = now;
+        break;
+      }
+
+      if ((now - auto_state_tick) > POINT_SEARCH_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      /* Keep the P8 heading and leave its intersection to the robot's right. */
+      move_degree(target_body_degree, 1.0f, 0.0f, POINT_SEARCH_POWER);
+
+      if (point_candidate_is_present())
+      {
+        route_depart_clear_tick = 0U;
+        break;
+      }
+
+      if (route_depart_clear_tick == 0U)
+      {
+        route_depart_clear_tick = now;
+      }
+
+      if ((now - route_depart_clear_tick) >= POINT_REARM_CLEAR_MS)
+      {
+        PointDetect_Reset();
+        point_detection_enabled = true;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P8_RIGHT_TO_P9;
+      }
+      break;
+
+    case AUTO_STATE_P8_RIGHT_TO_P9:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > POINT_SEARCH_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      point_search_move(target_body_degree, 1.0f, 0.0f);
+
+      if (point_event)
+      {
+        stop_drive_motors();
+        point_align_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P9_ALIGN;
+      }
+      break;
+
+    case AUTO_STATE_P9_ALIGN:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      /* Never continue to the diagonal leg when P9 alignment has failed. */
+      if ((now - auto_state_tick) > P9_ALIGN_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        point_detection_enabled = false;
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      if (point_align_update(now))
+      {
+        current_point_index++;
+        point_arrived = true;
+        stop_drive_motors();
+        point_detection_enabled = false;
+        point_align_reset();
+        route_depart_clear_tick = 0U;
+        front_line_detect_candidate_tick = 0U;
+        p9_diagonal_start_tick = now;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P9_DIAGONAL_LEAVE;
+      }
+      break;
+
+    case AUTO_STATE_P9_DIAGONAL_LEAVE:
+      point_arrived = false;
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((line_adc_center_last_update_tick == 0U) ||
+          ((now - line_adc_center_last_update_tick) > LINE_CENTER_STALE_MS))
+      {
+        stop_drive_motors();
+        route_depart_clear_tick = 0U;
+        p9_diagonal_start_tick = now;
+        auto_state_tick = now;
+        break;
+      }
+
+      /* Right-rear diagonal while keeping exactly the same body heading. */
+      move_degree(
+          target_body_degree,
+          P9_DIAGONAL_COMPONENT,
+          -P9_DIAGONAL_COMPONENT,
+          POINT_SEARCH_POWER);
+
+      /* Do not mistake the front line at P9 for the line to be acquired. */
+      if (front_line_raw_is_present())
+      {
+        route_depart_clear_tick = 0U;
+        break;
+      }
+
+      if (route_depart_clear_tick == 0U)
+      {
+        route_depart_clear_tick = now;
+      }
+
+      if ((now - route_depart_clear_tick) >= POINT_REARM_CLEAR_MS)
+      {
+        front_line_detect_candidate_tick = 0U;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P9_DIAGONAL_FIND_LINE;
+      }
+      break;
+
+    case AUTO_STATE_P9_DIAGONAL_FIND_LINE:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((line_adc_center_last_update_tick == 0U) ||
+          ((now - line_adc_center_last_update_tick) > LINE_CENTER_STALE_MS))
+      {
+        stop_drive_motors();
+        front_line_detect_candidate_tick = 0U;
+        p9_diagonal_start_tick = now;
+        auto_state_tick = now;
+        break;
+      }
+
+      /* Ignore any vertical line reached too soon after leaving P9. */
+      if ((p9_diagonal_start_tick == 0U) ||
+          ((now - p9_diagonal_start_tick) < P9_EARLY_LINE_IGNORE_MS))
+      {
+        if (p9_diagonal_start_tick == 0U)
+        {
+          p9_diagonal_start_tick = now;
+        }
+
+        front_line_detect_candidate_tick = 0U;
+        move_degree(
+            target_body_degree,
+            P9_DIAGONAL_COMPONENT,
+            -P9_DIAGONAL_COMPONENT,
+            POINT_SEARCH_POWER);
+        break;
+      }
+
+      if (front_line_raw_is_present())
+      {
+        /* Brake on the first raw hit and confirm it while stationary so the
+         * diagonal search cannot coast completely across the guide line. */
+        stop_drive_motors();
+
+        if (front_line_is_present_for(P9_FRONT_LINE_CONFIRM_MS))
+        {
+          PointDetect_Reset();
+          line_trace_reset();
+          route_depart_clear_tick = 0U;
+          auto_state_tick = now;
+          auto_state = AUTO_STATE_P9_REVERSE_TRACE_REARM;
+        }
+        break;
+      }
+
+      front_line_detect_candidate_tick = 0U;
+      move_degree(
+          target_body_degree,
+          P9_DIAGONAL_COMPONENT,
+          -P9_DIAGONAL_COMPONENT,
+          POINT_SEARCH_POWER);
+      break;
+
+    case AUTO_STATE_P9_REVERSE_TRACE_REARM:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > POINT_SEARCH_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      if (!line_trace_move(target_body_degree, -1.0f))
+      {
+        route_depart_clear_tick = 0U;
+        auto_state_tick = now;
+        break;
+      }
+
+      /* Arm P10 detection only after the line-acquisition area is clear. */
+      if (point_candidate_is_present())
+      {
+        route_depart_clear_tick = 0U;
+        break;
+      }
+
+      if (route_depart_clear_tick == 0U)
+      {
+        route_depart_clear_tick = now;
+      }
+
+      if ((now - route_depart_clear_tick) >= POINT_REARM_CLEAR_MS)
+      {
+        PointDetect_Reset();
+        point_detection_enabled = true;
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P9_REVERSE_TO_P10;
+      }
+      break;
+
+    case AUTO_STATE_P9_REVERSE_TO_P10:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if ((now - auto_state_tick) > POINT_SEARCH_TIMEOUT_MS)
+      {
+        stop_drive_motors();
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      (void)line_trace_point_search(target_body_degree, -1.0f);
+
+      if (point_event)
+      {
+        current_point_index++;
+        stop_drive_motors();
+        point_align_reset();
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_P10_FINAL_ALIGN;
+      }
+      break;
+
+    case AUTO_STATE_P10_FINAL_ALIGN:
+      point_detection_enabled = true;
+      arm_vertical_command = 0.0f;
+      arm_gripper_command = 0.0f;
+
+      if (((now - auto_state_tick) > ROUTE_ALIGN_TIMEOUT_MS) ||
+          point_align_update(now))
+      {
+        point_arrived = true;
+        stop_drive_motors();
+        point_detection_enabled = false;
+        point_align_reset();
         auto_state = AUTO_STATE_ROUTE_COMPLETE;
       }
       break;
@@ -1647,13 +2888,13 @@ void AutoControl_Task(void)
     case AUTO_STATE_ERROR:
       arm_vertical_command = 0.0f;
       arm_gripper_command = 0.0f;
-      move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+      stop_drive_motors();
       break;
 
     default:
       arm_vertical_command = 0.0f;
       arm_gripper_command = 0.0f;
-      move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+      stop_drive_motors();
       auto_control_error = true;
       auto_state = AUTO_STATE_ERROR;
       break;
