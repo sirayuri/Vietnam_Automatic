@@ -57,6 +57,8 @@
 #define FRONT_LINE_MIN_BLACK      3U
 #define POINT_RIGHT_MIN_BLACK     3U
 #define POINT_SEARCH_POWER        700.0f
+#define P5_POINT_SEARCH_POWER     600.0f
+#define P9_POINT_SEARCH_POWER     600.0f
 #define POINT_ALIGN_POWER         700.0f
 #define POINT_MIN_START_PWM       650.0f
 #define DONUT_MOVE_POWER          700.0f
@@ -107,6 +109,7 @@
 #define P9_ALIGN_TIMEOUT_MS           3000U
 #define P9_EARLY_LINE_IGNORE_MS       5000U
 #define P9_FRONT_LINE_CONFIRM_MS       600U
+#define P9_FRONT_LINE_MIN_CONFIDENCE 1500.0f
 
 /* Set to 0 to restore the legacy 3.5 / 3.5 sensor-center targets. */
 #define USE_MEASURED_LINE_CENTERS        0U
@@ -234,6 +237,10 @@ float point_align_D_gain_y = 0.0f;
 float line_trace_P_gain = 0.06f;
 float line_trace_I_gain = 0.0f;
 float line_trace_D_gain = 0.0f;
+/* Right-line PID output is robot-relative vy while vx is fixed left/right. */
+float right_line_trace_P_gain = 0.06f;
+float right_line_trace_I_gain = 0.0f;
+float right_line_trace_D_gain = 0.0f;
 float body_turn_P_gain = 20.0f;
 float PID_err = 0.0;
 float PID_err_old = 0.0;
@@ -608,7 +615,11 @@ void PointDetect_Task(void)
 /* Stop as soon as an intersection candidate appears.  Confirmation then
  * happens while stationary, preventing the 300 ms confirmation interval from
  * carrying the chassis past the center of the intersection. */
-static void point_search_move(float body_degree, float vx, float vy)
+static void point_search_move_with_power(
+    float body_degree,
+    float vx,
+    float vy,
+    float drive_power)
 {
   if (point_state == POINT_STATE_CANDIDATE)
   {
@@ -616,7 +627,16 @@ static void point_search_move(float body_degree, float vx, float vy)
     return;
   }
 
-  move_degree(body_degree, vx, vy, POINT_SEARCH_POWER);
+  move_degree(body_degree, vx, vy, drive_power);
+}
+
+static void point_search_move(float body_degree, float vx, float vy)
+{
+  point_search_move_with_power(
+      body_degree,
+      vx,
+      vy,
+      POINT_SEARCH_POWER);
 }
 
 static void set_motor_pwm_with_limit(TIM_HandleTypeDef *timer,
@@ -877,6 +897,107 @@ static bool line_trace_point_search(float body_degree, float vy)
   }
 
   return line_trace_move(body_degree, vy);
+}
+
+/* During a right/left traverse, the right sensor crosses the guide line in
+ * the robot's forward/rear direction.  Keep vx fixed and use line-position
+ * PID as a small vy correction.  move_degree() simultaneously holds yaw. */
+static float right_line_trace_integral = 0.0f;
+static float right_line_trace_previous_error = 0.0f;
+static float right_line_trace_correction = 0.0f;
+static uint32_t right_line_trace_last_sample_tick = 0U;
+
+static void right_line_trace_reset(void)
+{
+  right_line_trace_integral = 0.0f;
+  right_line_trace_previous_error = 0.0f;
+  right_line_trace_correction = 0.0f;
+  right_line_trace_last_sample_tick = 0U;
+}
+
+static bool right_line_trace_move(
+    float body_degree,
+    float vx,
+    float drive_power)
+{
+  uint32_t now = HAL_GetTick();
+  line_sensor_position_t right;
+
+  get_line_sensor_position(
+      line_adc_right,
+      line_right_white_mean,
+      line_right_white_sigma,
+      line_right_green_mean,
+      line_right_green_sigma,
+      line_right_red_mean,
+      line_right_red_sigma,
+      &right);
+
+  if (!right.valid)
+  {
+    right_line_trace_reset();
+    move_degree(body_degree, 0.0f, 0.0f, 0.0f);
+    return false;
+  }
+
+  if ((right_line_trace_last_sample_tick == 0U) ||
+      ((now - right_line_trace_last_sample_tick) >=
+       LINE_TRACE_CONTROL_PERIOD_MS))
+  {
+    /* Right S0 is rear and S7 is front: positive error moves forward. */
+    float error = right.position - RIGHT_LINE_CENTER_POSITION;
+    float dt = (right_line_trace_last_sample_tick == 0U) ?
+               ((float)LINE_TRACE_CONTROL_PERIOD_MS / 1000.0f) :
+               ((float)(now - right_line_trace_last_sample_tick) / 1000.0f);
+    if (dt < 0.001f)
+    {
+      dt = 0.001f;
+    }
+
+    right_line_trace_integral += error * dt;
+    right_line_trace_integral = limit_float(
+        right_line_trace_integral,
+        -3.0f,
+        3.0f);
+
+    float derivative = (right_line_trace_last_sample_tick == 0U) ?
+                       0.0f :
+                       ((error - right_line_trace_previous_error) / dt);
+
+    right_line_trace_correction =
+        (right_line_trace_P_gain * error) +
+        (right_line_trace_I_gain * right_line_trace_integral) +
+        (right_line_trace_D_gain * derivative);
+    right_line_trace_correction = limit_float(
+        right_line_trace_correction,
+        -LINE_TRACE_MAX_CORRECTION,
+        LINE_TRACE_MAX_CORRECTION);
+
+    right_line_trace_previous_error = error;
+    right_line_trace_last_sample_tick = now;
+  }
+
+  move_degree(
+      body_degree,
+      (vx >= 0.0f) ? 1.0f : -1.0f,
+      right_line_trace_correction,
+      drive_power);
+  return true;
+}
+
+static bool right_line_trace_point_search(
+    float body_degree,
+    float vx,
+    float drive_power)
+{
+  if (point_state == POINT_STATE_CANDIDATE)
+  {
+    right_line_trace_reset();
+    move_degree(body_degree, 0.0f, 0.0f, 0.0f);
+    return true;
+  }
+
+  return right_line_trace_move(body_degree, vx, drive_power);
 }
 
 static uint32_t body_turn_stable_tick = 0U;
@@ -1180,7 +1301,7 @@ static donut_move_result_t DonutMove_Task(
 }
 
 /* Instantaneous front-line result used while already in the alignment state. */
-static bool front_line_raw_is_present(void)
+static bool front_line_raw_is_present_with_confidence(float min_confidence)
 {
   line_sensor_features_t front_features;
   line_sensor_position_t front;
@@ -1211,7 +1332,13 @@ static bool front_line_raw_is_present(void)
       line_front_red_sigma,
       &front_features);
 
-  return front_line_features_is_present(&front_features);
+  return front_line_features_is_present(&front_features) &&
+         (front.confidence >= min_confidence);
+}
+
+static bool front_line_raw_is_present(void)
+{
+  return front_line_raw_is_present_with_confidence(0.0f);
 }
 
 /*
@@ -1219,11 +1346,13 @@ static bool front_line_raw_is_present(void)
  * change state.  This prevents a single noisy CDC packet from immediately
  * entering AUTO_STATE_ALIGN_FRONT_LINE.
  */
-static bool front_line_is_present_for(uint32_t confirm_ms)
+static bool front_line_is_present_for_with_confidence(
+    uint32_t confirm_ms,
+    float min_confidence)
 {
   uint32_t now = HAL_GetTick();
 
-  if (!front_line_raw_is_present())
+  if (!front_line_raw_is_present_with_confidence(min_confidence))
   {
     front_line_detect_candidate_tick = 0U;
     return false;
@@ -1235,6 +1364,11 @@ static bool front_line_is_present_for(uint32_t confirm_ms)
   }
 
   return (now - front_line_detect_candidate_tick) >= confirm_ms;
+}
+
+static bool front_line_is_present_for(uint32_t confirm_ms)
+{
+  return front_line_is_present_for_with_confidence(confirm_ms, 0.0f);
 }
 
 static bool front_line_is_present(void)
@@ -1901,7 +2035,13 @@ void AutoControl_Task(void)
       }
 
       /* Continue forward and stop at the third following intersection. */
-      point_search_move(target_body_degree, 0.0f, 1.0f);
+      point_search_move_with_power(
+          target_body_degree,
+          0.0f,
+          1.0f,
+          (route_final_forward_point_count >=
+           (ROUTE_FINAL_FORWARD_POINTS - 1U)) ?
+              P5_POINT_SEARCH_POWER : POINT_SEARCH_POWER);
 
       if (point_event)
       {
@@ -2577,6 +2717,7 @@ void AutoControl_Task(void)
         point_align_reset();
         route_depart_clear_tick = 0U;
         PointDetect_Reset();
+        right_line_trace_reset();
         auto_state_tick = now;
         auto_state = AUTO_STATE_P8_LEAVE_RIGHT;
         break;
@@ -2590,6 +2731,7 @@ void AutoControl_Task(void)
         point_align_reset();
         route_depart_clear_tick = 0U;
         PointDetect_Reset();
+        right_line_trace_reset();
         auto_state_tick = now;
         auto_state = AUTO_STATE_P8_LEAVE_RIGHT;
       }
@@ -2618,8 +2760,16 @@ void AutoControl_Task(void)
         break;
       }
 
-      /* Keep the P8 heading and leave its intersection to the robot's right. */
-      move_degree(target_body_degree, 1.0f, 0.0f, POINT_SEARCH_POWER);
+      /* Leave P8 slowly to the right while right-line position PID corrects
+       * forward/rear drift and move_degree() holds the body yaw. */
+      if (!right_line_trace_move(
+              target_body_degree,
+              1.0f,
+              P9_POINT_SEARCH_POWER))
+      {
+        route_depart_clear_tick = 0U;
+        break;
+      }
 
       if (point_candidate_is_present())
       {
@@ -2654,11 +2804,15 @@ void AutoControl_Task(void)
         break;
       }
 
-      point_search_move(target_body_degree, 1.0f, 0.0f);
+      (void)right_line_trace_point_search(
+          target_body_degree,
+          1.0f,
+          P9_POINT_SEARCH_POWER);
 
       if (point_event)
       {
         stop_drive_motors();
+        right_line_trace_reset();
         point_align_reset();
         auto_state_tick = now;
         auto_state = AUTO_STATE_P9_ALIGN;
@@ -2771,13 +2925,16 @@ void AutoControl_Task(void)
         break;
       }
 
-      if (front_line_raw_is_present())
+      if (front_line_raw_is_present_with_confidence(
+              P9_FRONT_LINE_MIN_CONFIDENCE))
       {
         /* Brake on the first raw hit and confirm it while stationary so the
          * diagonal search cannot coast completely across the guide line. */
         stop_drive_motors();
 
-        if (front_line_is_present_for(P9_FRONT_LINE_CONFIRM_MS))
+        if (front_line_is_present_for_with_confidence(
+                P9_FRONT_LINE_CONFIRM_MS,
+                P9_FRONT_LINE_MIN_CONFIDENCE))
         {
           PointDetect_Reset();
           line_trace_reset();
