@@ -14,8 +14,10 @@ extern volatile uint16_t line_adc_center[8];
 extern volatile uint32_t line_adc_center_last_update_tick;
 extern volatile bool limit_bottom;
 extern volatile bool limit_top;
+extern volatile uint32_t limit_last_update_tick;
 extern volatile uint16_t TOF_arm;
 extern volatile uint16_t TOF_hall;
+extern volatile uint32_t tof_last_update_tick;
 
 //USBバッファ関係
 static char rx_buf[CDC_RX_SIZE];
@@ -222,6 +224,7 @@ void CDC_Protocol_Process(char *rx)
 
         TOF_arm = (uint16_t)value1;
         TOF_hall = (uint16_t)value2;
+        tof_last_update_tick = HAL_GetTick();
         snprintf(tx_buf, sizeof(tx_buf), "OK TOF %u %u\r\n", (unsigned int)TOF_arm, (unsigned int)TOF_hall);
         send_text(tx_buf);
     }
@@ -242,6 +245,7 @@ void CDC_Protocol_Process(char *rx)
         /* Limit switches are measured by the dedicated sensor MCU. */
         limit_top = (value1 != 0U);
         limit_bottom = (value2 != 0U);
+        limit_last_update_tick = HAL_GetTick();
         snprintf(tx_buf, sizeof(tx_buf), "OK LIMIT %u %u\r\n", limit_bottom ? 1U : 0U, limit_top ? 1U : 0U);
         send_text(tx_buf);
     }

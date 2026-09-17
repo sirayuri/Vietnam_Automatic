@@ -51,12 +51,25 @@
 #define POINT_CONFIRM_MS          200U
 #define FRONT_LINE_CONFIRM_MS     200U
 #define POINT_REARM_CLEAR_MS      120U
-#define LINE_CENTER_STALE_MS      100U
+#define LINE_CENTER_STALE_MS      200U
 #define FRONT_LINE_MIN_BLACK      3U
 #define POINT_RIGHT_MIN_BLACK     3U
 #define POINT_SEARCH_POWER        700.0f
 #define POINT_ALIGN_POWER         700.0f
 #define POINT_MIN_START_PWM       650.0f
+#define DONUT_MOVE_POWER          700.0f
+#define DONUT_TOF_STALE_MS        300U
+#define DONUT_TOF_CONFIRM_MS      150U
+#define DONUT_TOF_TOLERANCE_MM    15U
+#define DONUT_MIN_DISTANCE_DROP_MM 30U
+#define DONUT_MOVE_TIMEOUT_MS     10000U
+#define DONUT_GUIDE_APPROACH_POWER 650.0f
+#define DONUT_GUIDE_APPROACH_MS    500U
+#define ARM_LOWER_POWER            700.0f
+#define ARM_LOWER_TIMEOUT_MS       5000U
+#define LINE_RED_SIGMA_FLOOR       20.0f
+#define ENABLE_ARM_VERTICAL       1U
+#define ARM_LIMIT_STALE_MS        300U
 #define POINT_SEARCH_TIMEOUT_MS   10000U
 #define POINT_ALIGN_TIMEOUT_MS    3000U
 #define FRONT_LINE_ALIGN_TIMEOUT_MS 3000U
@@ -131,9 +144,25 @@ volatile bool point_detection_enabled = false;
 
 volatile bool limit_bottom = false;
 volatile bool limit_top = false;
+volatile uint32_t limit_last_update_tick = 0U;
 
 volatile uint16_t TOF_arm = 0;
 volatile uint16_t TOF_hall = 0;
+volatile uint32_t tof_last_update_tick = 0U;
+
+/* Configure these later after measuring the actual TOF values. */
+volatile uint16_t donut_floor_distance_mm = 430U;
+volatile uint16_t donut_surface_distance_mm = 380U;
+volatile uint16_t donut_tof_tolerance_mm = DONUT_TOF_TOLERANCE_MM;
+
+/* 0 = TOF_arm, 1 = TOF_hall. */
+volatile uint8_t donut_tof_source = 1;
+
+/* Tune this time to match the distance from the TOF trigger point to the arm guide. */
+volatile uint32_t donut_guide_approach_time_ms = DONUT_GUIDE_APPROACH_MS;
+
+/* +PWM = arm down, -PWM = arm up.  Kept at zero until the arm is tested. */
+volatile float arm_vertical_command = 0.0f;
 
 float P_gain = 9.0;
 float I_gain = 0.0;
@@ -197,7 +226,8 @@ typedef struct
 /*
  * These values are initial background models obtained from the supplied
  * white/green floor logs.  The threshold is the larger of the white and
- * green background limits, plus a margin.  Black is expected to produce a
+ * green background limits, plus a margin.  The front sensor also uses a
+ * recalculated red-floor background model.  Black is expected to produce a
  * larger ADC value.
  */
 static const float line_right_white_mean[LINE_SENSOR_COUNT] =
@@ -208,7 +238,6 @@ static const float line_right_green_mean[LINE_SENSOR_COUNT] =
   {3248.0f, 3177.0f, 2561.0f, 2483.0f, 2776.0f, 3063.0f, 2843.0f, 3071.0f};
 static const float line_right_green_sigma[LINE_SENSOR_COUNT] =
   {   5.0f,    6.0f,    6.0f,    6.0f,    6.0f,    5.0f,    6.0f,    8.0f};
-
 static const float line_front_white_mean[LINE_SENSOR_COUNT] =
   {1910.0f, 1540.0f, 1835.0f, 1055.0f, 1410.0f, 1320.0f, 740.0f, 970.0f};
 static const float line_front_white_sigma[LINE_SENSOR_COUNT] =
@@ -217,11 +246,11 @@ static const float line_front_green_mean[LINE_SENSOR_COUNT] =
   {1787.0f, 1628.0f, 1868.0f,  645.0f,  731.0f, 1215.0f, 387.0f, 610.0f};
 static const float line_front_green_sigma[LINE_SENSOR_COUNT] =
   {   8.0f,    7.0f,    7.0f,    7.0f,    7.0f,    7.0f,   7.0f,   8.0f};
-/* Red-floor background measured from the latest front-sensor logs. */
+/* Recalculated from the latest 29 red-floor samples supplied by the user. */
 static const float line_front_red_mean[LINE_SENSOR_COUNT] =
-  {2021.0f, 2154.0f, 1895.0f, 970.0f, 1225.0f, 1314.0f, 351.0f, 669.0f};
+  {1994.79f, 1856.55f, 1866.79f, 1153.62f, 1248.93f, 1304.93f, 558.10f, 929.76f};
 static const float line_front_red_sigma[LINE_SENSOR_COUNT] =
-  {  10.0f,   10.0f,   10.0f,  10.0f,   10.0f,   10.0f,  10.0f,  10.0f};
+  {  46.47f,    8.88f,    9.03f, 133.20f,   14.66f,   52.80f,  26.85f, 112.37f};
 
 typedef enum
 {
@@ -239,6 +268,16 @@ static float background_limit(float mean, float sigma)
 {
   /* Four sigma rejects the measured floor noise; the margin covers drift. */
   return mean + (4.0f * sigma) + 80.0f;
+}
+
+static float red_background_limit(float mean, float sigma)
+{
+  /* Static red-floor logs are very stable; reserve margin for motion. */
+  if (sigma < LINE_RED_SIGMA_FLOOR)
+  {
+    sigma = LINE_RED_SIGMA_FLOOR;
+  }
+  return background_limit(mean, sigma);
 }
 
 static void get_line_sensor_features(
@@ -272,7 +311,7 @@ static void get_line_sensor_features(
 
     if ((red_mean != NULL) && (red_sigma != NULL))
     {
-      float red_limit = background_limit(red_mean[i], red_sigma[i]);
+      float red_limit = red_background_limit(red_mean[i], red_sigma[i]);
       if (red_limit > threshold)
       {
         threshold = red_limit;
@@ -348,9 +387,15 @@ static void get_line_sensor_position(
     {
       floor_reference = red_mean[i];
     }
-    if ((red_sigma != NULL) && (red_sigma[i] > sigma))
+    if (red_sigma != NULL)
     {
-      sigma = red_sigma[i];
+      float red_sigma_effective =
+          (red_sigma[i] > LINE_RED_SIGMA_FLOOR) ?
+          red_sigma[i] : LINE_RED_SIGMA_FLOOR;
+      if (red_sigma_effective > sigma)
+      {
+        sigma = red_sigma_effective;
+      }
     }
     float noise_gate = (3.0f * sigma) + 40.0f;
     float signal = (float)raw[i] - floor_reference - noise_gate;
@@ -512,6 +557,46 @@ static void set_motor_pwm(TIM_HandleTypeDef *timer,
   }
 }
 
+/*
+ * Motor 6 vertical arm control.
+ *   command > 0 : down  (TIM4 CH1)
+ *   command < 0 : up    (TIM4 CH2)
+ *
+ * limit_top and limit_bottom are the active-state booleans received from the
+ * dedicated sensor MCU via CDC.  A stale limit packet also stops the motor.
+ */
+static void ArmVertical_Move(float command)
+{
+#if ENABLE_ARM_VERTICAL
+  uint32_t now = HAL_GetTick();
+
+  if ((limit_last_update_tick == 0U) ||
+      ((now - limit_last_update_tick) > ARM_LIMIT_STALE_MS))
+  {
+    set_motor_pwm(&htim4, TIM_CHANNEL_1, TIM_CHANNEL_2, 0.0f);
+    return;
+  }
+
+  /* Positive command is down, so the bottom switch blocks it. */
+  if ((command > 0.0f) && limit_bottom)
+  {
+    command = 0.0f;
+  }
+
+  /* Negative command is up, so the top switch blocks it. */
+  if ((command < 0.0f) && limit_top)
+  {
+    command = 0.0f;
+  }
+
+  set_motor_pwm(&htim4, TIM_CHANNEL_1, TIM_CHANNEL_2, command);
+#else
+  /* Keep motor 6 stopped while arm control is disabled for testing. */
+  (void)command;
+  set_motor_pwm(&htim4, TIM_CHANNEL_1, TIM_CHANNEL_2, 0.0f);
+#endif
+}
+
 static void stop_drive_motors(void)
 {
   set_motor_pwm(&htim1, TIM_CHANNEL_2, TIM_CHANNEL_1, 0.0f); /* M1 RR */
@@ -561,6 +646,10 @@ typedef enum
   AUTO_STATE_MOVE_FORWARD_TO_POINT,
   AUTO_STATE_ALIGN_POINT,
   AUTO_STATE_POINT_REACHED,
+  AUTO_STATE_MOVE_TO_DONUT,
+  AUTO_STATE_DONUT_GUIDE_APPROACH,
+  AUTO_STATE_LOWER_ARM,
+  AUTO_STATE_DONUT_REACHED,
   AUTO_STATE_ERROR
 } auto_state_t;
 
@@ -574,6 +663,7 @@ static float point_align_integral_y = 0.0f;
 static float point_align_previous_x = 0.0f;
 static float point_align_previous_y = 0.0f;
 static uint32_t point_align_last_tick = 0U;
+static uint32_t donut_surface_candidate_tick = 0U;
 
 static void apply_minimum_motion_vector(float *vx, float *vy)
 {
@@ -610,6 +700,91 @@ static void point_align_reset(void)
   point_align_previous_x = 0.0f;
   point_align_previous_y = 0.0f;
   point_align_last_tick = 0U;
+}
+
+typedef enum
+{
+  DONUT_MOVE_RUNNING = 0,
+  DONUT_MOVE_REACHED,
+  DONUT_MOVE_ERROR
+} donut_move_result_t;
+
+static uint16_t get_selected_donut_tof(void)
+{
+  return (donut_tof_source == 0U) ? TOF_arm : TOF_hall;
+}
+
+/*
+ * Move forward from the point until the selected downward-facing TOF sees
+ * the configured donut surface distance.  This is a non-blocking task:
+ * call it once per main-loop iteration.  The floor distance is used to
+ * verify that the detected surface is actually closer than the floor.
+ */
+static donut_move_result_t DonutMove_Task(
+    uint16_t floor_distance_mm,
+    uint16_t surface_distance_mm)
+{
+  uint32_t now = HAL_GetTick();
+
+  if ((floor_distance_mm == 0U) ||
+      (surface_distance_mm == 0U) ||
+      ((uint32_t)surface_distance_mm + DONUT_MIN_DISTANCE_DROP_MM >=
+       (uint32_t)floor_distance_mm))
+  {
+    donut_surface_candidate_tick = 0U;
+    move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+    return DONUT_MOVE_ERROR;
+  }
+
+  if ((tof_last_update_tick == 0U) ||
+      ((now - tof_last_update_tick) > DONUT_TOF_STALE_MS))
+  {
+    donut_surface_candidate_tick = 0U;
+    move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+    return DONUT_MOVE_ERROR;
+  }
+
+  uint16_t tof_distance_mm = get_selected_donut_tof();
+  if (tof_distance_mm == 0U)
+  {
+    donut_surface_candidate_tick = 0U;
+    move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+    return DONUT_MOVE_ERROR;
+  }
+
+  int32_t surface_error = (int32_t)tof_distance_mm -
+                          (int32_t)surface_distance_mm;
+  if (surface_error < 0)
+  {
+    surface_error = -surface_error;
+  }
+
+  bool closer_than_floor =
+      ((int32_t)floor_distance_mm - (int32_t)tof_distance_mm) >=
+      (int32_t)DONUT_MIN_DISTANCE_DROP_MM;
+  bool near_donut_surface =
+      surface_error <= (int32_t)donut_tof_tolerance_mm;
+
+  if (closer_than_floor && near_donut_surface)
+  {
+    move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+
+    if (donut_surface_candidate_tick == 0U)
+    {
+      donut_surface_candidate_tick = now;
+    }
+
+    if ((now - donut_surface_candidate_tick) >= DONUT_TOF_CONFIRM_MS)
+    {
+      return DONUT_MOVE_REACHED;
+    }
+
+    return DONUT_MOVE_RUNNING;
+  }
+
+  donut_surface_candidate_tick = 0U;
+  move_degree(target_body_degree, 0.0f, 1.0f, DONUT_MOVE_POWER);
+  return DONUT_MOVE_RUNNING;
 }
 
 /* Instantaneous front-line result used while already in the alignment state. */
@@ -979,13 +1154,111 @@ void AutoControl_Task(void)
         point_arrived = true;
         current_point_index++;
         move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+        arm_vertical_command = 0.0f;
+        point_detection_enabled = false;
+        donut_surface_candidate_tick = 0U;
         auto_state = AUTO_STATE_POINT_REACHED;
       }
       break;
 
     case AUTO_STATE_POINT_REACHED:
-      /* Hold here until the next point-specific action is implemented. */
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
       move_degree(0.0f, 0.0f, 0.0f, 0.0f);
+
+      /* Start the donut approach automatically once both distances are set. */
+      if ((donut_floor_distance_mm > 0U) &&
+          (donut_surface_distance_mm > 0U))
+      {
+        auto_state_tick = now;
+        donut_surface_candidate_tick = 0U;
+        auto_state = AUTO_STATE_MOVE_TO_DONUT;
+      }
+      break;
+
+    case AUTO_STATE_MOVE_TO_DONUT:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+
+      if ((now - auto_state_tick) > DONUT_MOVE_TIMEOUT_MS)
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      switch (DonutMove_Task(
+          donut_floor_distance_mm,
+          donut_surface_distance_mm))
+      {
+        case DONUT_MOVE_REACHED:
+          move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+          auto_state_tick = now;
+          auto_state = AUTO_STATE_DONUT_GUIDE_APPROACH;
+          break;
+
+        case DONUT_MOVE_ERROR:
+          move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+          auto_control_error = true;
+          auto_state = AUTO_STATE_ERROR;
+          break;
+
+        case DONUT_MOVE_RUNNING:
+        default:
+          break;
+      }
+      break;
+
+    case AUTO_STATE_DONUT_GUIDE_APPROACH:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+
+      /* Move slowly for the tunable distance to press the donut into the guide. */
+      if ((now - auto_state_tick) >= donut_guide_approach_time_ms)
+      {
+        move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+        auto_state_tick = now;
+        auto_state = AUTO_STATE_LOWER_ARM;
+        break;
+      }
+
+      move_degree(
+          target_body_degree,
+          0.0f,
+          1.0f,
+          DONUT_GUIDE_APPROACH_POWER);
+      break;
+
+    case AUTO_STATE_LOWER_ARM:
+      point_detection_enabled = false;
+      move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
+
+      if (limit_bottom)
+      {
+        arm_vertical_command = 0.0f;
+        auto_state = AUTO_STATE_DONUT_REACHED;
+        break;
+      }
+
+      if ((limit_last_update_tick == 0U) ||
+          ((now - limit_last_update_tick) > ARM_LIMIT_STALE_MS) ||
+          ((now - auto_state_tick) > ARM_LOWER_TIMEOUT_MS))
+      {
+        arm_vertical_command = 0.0f;
+        auto_control_error = true;
+        auto_state = AUTO_STATE_ERROR;
+        break;
+      }
+
+      /* Motor 6: +700 means down; ArmVertical_Move applies the bottom limit. */
+      arm_vertical_command = ARM_LOWER_POWER;
+      break;
+
+    case AUTO_STATE_DONUT_REACHED:
+      point_detection_enabled = false;
+      arm_vertical_command = 0.0f;
+      move_degree(target_body_degree, 0.0f, 0.0f, 0.0f);
       break;
 
     case AUTO_STATE_ERROR:
@@ -1166,6 +1439,7 @@ int main(void)
     CDC_Protocol_Task();
     PointDetect_Task();
     AutoControl_Task();
+    ArmVertical_Move(arm_vertical_command);
 
     /* RGB LED is reserved for line geometry debugging. */
     LineDebugLED_Task();
